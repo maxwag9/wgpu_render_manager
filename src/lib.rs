@@ -20,9 +20,9 @@
 //! ```
 //! Also features an automatic, extremely powerful compute pass system for textures.
 
-mod compute_system;
-mod generator;
-mod pipelines;
-mod fullscreen;
-mod renderer;
-mod bind_groups;
+pub mod compute_system;
+pub mod generator;
+pub mod pipelines;
+pub mod fullscreen;
+pub mod renderer;
+pub mod bind_groups;

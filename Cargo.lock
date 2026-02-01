@@ -929,14 +929,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wgpu-crm-mgr"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "wgpu",
-]
-
-[[package]]
 name = "wgpu-hal"
 version = "28.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -995,6 +987,14 @@ dependencies = [
  "js-sys",
  "log",
  "web-sys",
+]
+
+[[package]]
+name = "wgpu_crm_mgr"
+version = "0.1.1"
+dependencies = [
+ "bytemuck",
+ "wgpu",
 ]
 
 [[package]]
