@@ -5,6 +5,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use wgpu::*;
 
+#[derive(Clone, Debug)]
+pub struct ShadowOptions {
+    pub sampler: Sampler,
+    pub view: TextureView,
+}
+
 /// Configuration for creating a render pipeline.
 #[derive(Clone, Debug)]
 pub struct PipelineOptions {
@@ -15,6 +21,7 @@ pub struct PipelineOptions {
     pub cull_mode: Option<Face>,
     pub targets: Vec<Option<ColorTargetState>>,
     pub vertex_only: bool,
+    pub shadow: Option<ShadowOptions>
 }
 
 impl Default for PipelineOptions {
@@ -27,6 +34,7 @@ impl Default for PipelineOptions {
             cull_mode: None,
             targets: vec![],
             vertex_only: false,
+            shadow: None,
         }
     }
 }

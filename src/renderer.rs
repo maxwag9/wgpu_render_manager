@@ -108,19 +108,25 @@ impl RenderManager {
         uniforms: &[&Buffer],
         pass: &mut RenderPass,
     ) {
-        // Ensure material layout exists and fetch a cloned handle (brief borrow -> clone)
-        let material_count = texture_views.len();
-        let _ = self.materials.layout(material_count);
+        // Shadow pulled explicitly from pipeline options
+        let shadow = options.shadow.as_ref().map(|s| (&s.sampler, &s.view));
+        let has_shadow = shadow.is_some();
+
+        // Ensure material layout exists and clone handle
+        let _ = self.materials.layout(texture_views, has_shadow);
         let material_layout_handle = self
             .materials
             .layouts
-            .get(&material_count)
+            .get(&(texture_views.len(), has_shadow))
             .expect("material layout must exist")
             .clone();
 
-        // Ensure uniform layout exists if needed and fetch a cloned handle
+        // Uniform layout
         let uniform_count = uniforms.len();
-        let mut owned_bgls: Vec<BindGroupLayout> = Vec::with_capacity(if uniform_count > 0 { 2 } else { 1 });
+        let mut owned_bgls: Vec<BindGroupLayout> =
+            Vec::with_capacity(if uniform_count > 0 { 2 } else { 1 });
+
+        owned_bgls.push(material_layout_handle);
 
         if uniform_count > 0 {
             let _ = self.pipeline_cache.uniform_layout(uniform_count);
@@ -130,28 +136,24 @@ impl RenderManager {
                 .get(&uniform_count)
                 .expect("uniform layout must exist")
                 .clone();
-            owned_bgls.push(material_layout_handle);
             owned_bgls.push(uniform_layout_handle);
-        } else {
-            owned_bgls.push(material_layout_handle);
         }
 
-        // Create references that borrow from local owned_bgls (no borrows into self remain)
+        // Local references only
         let bind_group_layout_refs: Vec<&BindGroupLayout> = owned_bgls.iter().collect();
 
-        // Get or create pipeline (may mutably borrow pipeline_cache). Immediately clone the
-        // returned pipeline handle so we don't keep a borrow into pipeline_cache alive.
+        // Pipeline
         let pipeline_ref = self
             .pipeline_cache
             .get_or_create(shader_path, &bind_group_layout_refs, options);
-        let pipeline_handle = pipeline_ref.clone();
-        pass.set_pipeline(&pipeline_handle);
+        let pipeline = pipeline_ref.clone();
+        pass.set_pipeline(&pipeline);
 
-        // Create/get material bind group (works with &[&TextureView])
-        let material_bg = self.materials.get_or_create(texture_views);
+        // Material bind group
+        let material_bg = self.materials.get_or_create(texture_views, shadow);
         pass.set_bind_group(0, material_bg, &[]);
 
-        // Uniform bind group if needed
+        // Uniform bind group
         if uniform_count > 0 {
             let uniform_bg = self.get_or_create_uniform_bind_group(uniforms);
             pass.set_bind_group(1, uniform_bg, &[]);
@@ -162,13 +164,13 @@ impl RenderManager {
     /// Render using custom bind group layouts.
     ///
     /// For advanced use cases where you need full control over bind groups.
-    pub fn render_with_layouts<'a>(
-        &'a mut self,
+    pub fn render_with_layouts(
+        &mut self,
         shader_path: &Path,
         bind_group_layouts: &[&BindGroupLayout],
         bind_groups: &[&BindGroup],
         options: &PipelineOptions,
-        pass: &mut RenderPass<'a>,
+        pass: &mut RenderPass,
     ) {
         let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts, options);
         pass.set_pipeline(pipeline);
