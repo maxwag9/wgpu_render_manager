@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use wgpu::*;
 use wgpu::util::DeviceExt;
+use crate::compute_system::figure_out_aspect;
 
 const FULLSCREEN_COLOR_SHADER: &str = r#"
 struct VertexOutput {
@@ -664,7 +665,8 @@ impl FullscreenRenderer {
         target_view: &TextureView,
         pass: &mut RenderPass,
     ) {
-        let binding_type = infer_texture_binding_type(texture, &self.device, None);
+        //texture.texture().
+        let binding_type = infer_texture_binding_type(texture, &self.device);
         let sample_type = match binding_type {
             BindingType::Texture { sample_type, .. } => sample_type,
             _ => unreachable!("infer_texture_binding_type always returns BindingType::Texture"),
@@ -917,12 +919,21 @@ impl FullscreenRenderer {
 }
 
 /// Infer a `BindingType::Texture` for a view + device.
-fn infer_texture_binding_type(view: &TextureView, device: &Device, aspect: Option<TextureAspect>) -> BindingType {
+/// Automatically determines the correct aspect for depth-stencil formats.
+fn infer_texture_binding_type(view: &TextureView, device: &Device) -> BindingType {
     let format = view.texture().format();
-    // ask the format what sample type it wants for the given aspect + device features
+
+    // Determine the appropriate aspect for sampling
+    let aspect = figure_out_aspect(format);
+
     let sample_type = format
         .sample_type(aspect, Some(device.features()))
-        .expect("unsupported/ambiguous texture format + aspect for sampling");
+        .unwrap_or_else(|| {
+            panic!(
+                "unsupported texture format {:?} with aspect {:?} for sampling",
+                format, aspect
+            )
+        });
 
     let multisampled = view.texture().sample_count() > 1;
 

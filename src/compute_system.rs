@@ -452,15 +452,30 @@ impl ComputeSystem {
             return false;
         }
 
-        if format.has_depth_aspect() {
-            // Depth textures have their own sample type
+        // Determine the appropriate aspect for the format
+        let aspect = figure_out_aspect(format);
+
+        // Depth/stencil textures have their own sample type, not filterable float
+        if format.has_depth_aspect() || format.has_stencil_aspect() {
             return false;
         }
 
         // Check if the format supports filtering with current device features
-        match format.sample_type(None, Some(self.device.features())) {
+        match format.sample_type(aspect, Some(self.device.features())) {
             Some(TextureSampleType::Float { filterable }) => filterable,
             _ => false,
         }
+    }
+}
+pub(crate) fn figure_out_aspect(format: TextureFormat) -> Option<TextureAspect> {
+    if format.has_depth_aspect() && format.has_stencil_aspect() {
+        panic!("Fullscreen Debug Render received a Depth texture with both Depth aspect and Stencil aspect, which wgpu doesn't allow to be used in shaders together. \n \n \
+        Solution: Make another view of the same texture with TextureAspect::DepthOnly and pass that in instead. \n")
+    } else if format.has_depth_aspect() {
+        Some(TextureAspect::DepthOnly)
+    } else if format.has_stencil_aspect() {
+        Some(TextureAspect::StencilOnly)
+    } else {
+        None
     }
 }
