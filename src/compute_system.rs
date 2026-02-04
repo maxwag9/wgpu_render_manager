@@ -95,10 +95,29 @@ impl ComputeSystem {
         }
     }
 
-    /// Execute a compute shader.
+    /// Execute a compute shader, optionally using an existing command encoder.
     ///
-    /// This method creates (or reuses) a cached compute pipeline, sets up
-    /// bind groups, dispatches workgroups, and submits the command buffer.
+    /// This method creates (or reuses) a cached compute pipeline, sets up bind groups,
+    /// and dispatches workgroups.
+    ///
+    /// If `encoder` is `Some(&mut encoder)`, the compute pass is recorded into the provided
+    /// encoder (no finish/submit is performed).
+    ///
+    /// If `encoder` is `None`, a new command encoder is created, used for the pass,
+    /// finished, and immediately submitted to the queue.
+    ///
+    /// ### SYNCHRONIZATION WARNING
+    /// Creating a new encoder (i.e. passing `None`) while other command encoders are still
+    /// open is **extremely dangerous**. It can cause GPU timeline desynchronization,
+    /// resource hazards, validation layer errors, crashes, or silent corruption if the
+    /// operations touch overlapping resources without explicit barriers.
+    ///
+    /// **ALWAYS prefer passing an existing encoder** when you're doing multiple
+    /// compute/render operations in the same frame. Only use `None` for isolated,
+    /// one-off dispatches.
+    ///
+    /// In debug builds, a loud runtime warning will be printed if you create a new
+    /// encoder while others are active.
     ///
     /// ## Bind group layout
     /// - `@group(0)`: input textures + sampler
@@ -109,32 +128,33 @@ impl ComputeSystem {
     /// - `@group(2)`: uniform buffers
     ///   - `binding 0..k`: uniform buffers
     ///
-    /// Empty input, output, or uniform lists result in empty bind groups
-    /// for the corresponding slots.
+    /// Empty input/output/uniform lists create empty bind groups for those slots.
     ///
     /// ## Texture handling
-    /// - MSAA input textures are detected automatically via `sample_count`
+    /// - MSAA input textures are auto-detected via `sample_count`
     /// - Depth textures use depth sampling where applicable
     ///
     /// ## Parameters
-    /// - `label`: Debug label for the command encoder and compute pass
-    /// - `input_views`: Read-only input textures
-    /// - `output_views`: Write-only storage textures
+    /// - `encoder`: Optional existing encoder to record into
+    /// - `label`: Debug label for the encoder (if created) and compute pass
+    /// - `input_views`: Read-only input texture views
+    /// - `output_views`: Write-only storage texture views
     /// - `shader_path`: Path to the WGSL compute shader
     /// - `options`: Compute pipeline and dispatch configuration
     /// - `uniforms`: Optional uniform buffers
     ///
     /// ## Notes
-    /// - The shader entry point must be named `main`
-    /// - The dispatch size is taken from `options.dispatch_size`
+    /// - Shader entry point must be `main`
+    /// - Dispatch size comes from `options.dispatch_size`
     ///
     /// ## WGSL expectations
     /// - Entry point: `@compute @workgroup_size(...) fn main()`
-    /// - Input textures must match the order provided to `compute`
-    /// - Output textures must be declared as `texture_storage_2d`
-    /// - Uniform buffers must match binding indices exactly
+    /// - Input textures must match the order given
+    /// - Output textures must be `texture_storage_2d<... , write>`
+    /// - Uniforms must match binding indices exactly
     pub fn compute(
         &mut self,
+        encoder: Option<&mut CommandEncoder>,
         label: &str,
         input_views: Vec<&TextureView>,
         output_views: Vec<&TextureView>,
@@ -142,6 +162,26 @@ impl ComputeSystem {
         options: ComputePipelineOptions,
         uniforms: &[&Buffer],
     ) {
+        let encoder_is_none = encoder.is_none();
+        #[cfg(debug_assertions)]
+        {
+            if encoder_is_none {
+                let internal_counters = self.device.get_internal_counters();
+                let command_encoder_count = internal_counters.hal.command_encoders.read();
+                if command_encoder_count > 0 {
+                    eprintln!(
+                        "\n
+                     You're creating a NEW CommandEncoder for this compute dispatch while {} encoder(s) are already open!\n\
+                     This is a classic recipe for desynchronization disasters, resource hazards, validation errors, or straight-up crashes.\n\
+                     The GPU might execute the submitted commands out of order relative to your other in-flight encoders.\n\
+                     FIX: Pass an existing encoder with Some(&mut your_encoder) instead of None.\n\
+                     Do NOT ignore this unless you really know what you're doing.\n",
+                        command_encoder_count
+                    );
+                }
+            }
+        }
+
         let input_specs: Vec<_> = input_views
             .iter()
             .map(|v| {
@@ -164,13 +204,12 @@ impl ComputeSystem {
 
         // Get or create cached pipeline
         if !self.pipeline_cache.contains_key(&key) {
-            let cached =
-                self.create_pipeline(shader_path, &input_specs, &output_formats, uniforms.len());
+            let cached = self.create_pipeline(shader_path, &input_specs, &output_formats, uniforms.len());
             self.pipeline_cache.insert(key.clone(), cached);
         }
         let cached = self.pipeline_cache.get(&key).unwrap();
 
-        // Determine if we can use filtering sampler (all non-depth, non-msaa inputs must be filterable)
+        // Determine if we can use filtering sampler
         let use_filtering = input_specs.iter().all(|(format, sample_count, is_filterable)| {
             format.has_depth_aspect() || *sample_count > 1 || *is_filterable
         });
@@ -180,13 +219,22 @@ impl ComputeSystem {
         let output_bg = self.create_output_bind_group(&cached.bind_group_layouts[1], &output_views);
         let uniform_bg = self.create_uniform_bind_group(&cached.bind_group_layouts[2], uniforms);
 
-        // Execute
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor { label: Some(label) });
+        // Resolve encoder (external or create new)
+        let mut owned_encoder = None;
+        let enc = match encoder {
+            Some(e) => e,
+            None => {
+                owned_encoder = Some(
+                    self.device
+                        .create_command_encoder(&CommandEncoderDescriptor { label: Some(label) }),
+                );
+                owned_encoder.as_mut().unwrap()
+            }
+        };
 
+        // Record the compute pass
         {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+            let mut pass = enc.begin_compute_pass(&ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes: None,
             });
@@ -202,7 +250,11 @@ impl ComputeSystem {
             );
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // If we created our own encoder, finish and submit it
+        if encoder_is_none {
+            let finished = owned_encoder.unwrap().finish();
+            self.queue.submit(std::iter::once(finished));
+        }
     }
 
     // let mut compute = ComputeSystem::new(&device, &queue); // Caches device and queue so you don't have to pass it in again
