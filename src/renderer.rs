@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use wgpu::{BindGroup, BindGroupLayout, Buffer, Device, Queue, RenderPass, TextureView};
+use wgpu::{BindGroup, BindGroupLayout, Buffer, CommandEncoder, Device, Queue, RenderPass, TextureView};
 use crate::bind_groups::MaterialBindGroups;
+use crate::compute_system::{ComputePipelineOptions, ComputeSystem};
 use crate::fullscreen::{DebugVisualization, DepthDebugParams, FullscreenRenderer};
 use crate::generator::{TextureGenerator, TextureKey};
 use crate::pipelines::{PipelineCache, PipelineOptions};
@@ -48,7 +49,9 @@ pub struct RenderManager {
     pipeline_cache: PipelineCache,
     fullscreen: FullscreenRenderer,
     materials: MaterialBindGroups,
+    compute_system: ComputeSystem,
     uniform_bind_groups: HashMap<UniformBindGroupKey, BindGroup>,
+    defines: HashSet<String>
 }
 
 impl RenderManager {
@@ -66,7 +69,7 @@ impl RenderManager {
         let pipeline_cache = PipelineCache::new(device.clone());
         let fullscreen = FullscreenRenderer::new(device.clone(), queue.clone());
         let materials = MaterialBindGroups::new(device.clone());
-
+        let compute_system = ComputeSystem::new(device, queue);
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -74,7 +77,9 @@ impl RenderManager {
             pipeline_cache,
             fullscreen,
             materials,
+            compute_system,
             uniform_bind_groups: HashMap::new(),
+            defines: HashSet::new(),
         }
     }
 
@@ -113,6 +118,13 @@ impl RenderManager {
         &mut self.fullscreen
     }
 
+    /// Access the compute system.
+    ///
+    /// This renderer is used internally.
+    pub fn compute_system(&mut self) -> &mut ComputeSystem {
+        &mut self.compute_system
+    }
+
     /// Render using procedurally generated textures.
     ///
     /// This method resolves textures using the internal
@@ -141,6 +153,10 @@ impl RenderManager {
     /// - `@group(0) @binding(n+1)`: (optional) shadow_sampler
     /// - `@group(0) @binding(n+2)`: (optional) shadow textures as texture_depth_2d_array
     /// - `@group(1) @binding(0..n)`: uniforms, in the same order as input
+    ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
+    /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
+    /// standard WGSL before passing it to wgpu.
     /// ## Example
     /// ```no_run
     /// // Inside a render pass
@@ -192,6 +208,9 @@ impl RenderManager {
     /// - `@group(0) @binding(n+2)`: (optional) shadow textures as texture_depth_2d_array
     /// - `@group(1) @binding(0..n)`: uniforms, in the same order as input
     ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
+    /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
+    /// standard WGSL before passing it to wgpu.
     /// ## Example
     /// ```no_run
     /// // Inside a render pass
@@ -203,6 +222,7 @@ impl RenderManager {
     ///     &mut render_pass,          // Render Pass
     /// );
     /// ```
+
     pub fn render_with_textures(
         &mut self,
         texture_views: &[&TextureView],
@@ -248,7 +268,7 @@ impl RenderManager {
         // Pipeline
         let pipeline_ref = self
             .pipeline_cache
-            .get_or_create(shader_path, &bind_group_layout_refs, options);
+            .get_or_create(shader_path, &bind_group_layout_refs, options, &self.defines);
         let pipeline = pipeline_ref.clone();
         pass.set_pipeline(&pipeline);
 
@@ -271,6 +291,10 @@ impl RenderManager {
     ///
     /// No assumptions are made about binding order or layout structure.
     /// Bind groups are bound sequentially starting at index 0.
+    ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
+    /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
+    /// standard WGSL before passing it to wgpu.
     pub fn render_with_layouts(
         &mut self,
         shader_path: &Path,
@@ -279,7 +303,7 @@ impl RenderManager {
         options: &PipelineOptions,
         pass: &mut RenderPass,
     ) {
-        let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts, options);
+        let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts, options, &self.defines);
         pass.set_pipeline(pipeline);
 
         for (i, bg) in bind_groups.iter().enumerate() {
@@ -305,6 +329,120 @@ impl RenderManager {
         self.fullscreen.render(texture, visualization_type, target_view, pass);
     }
 
+    /// Execute a compute shader, optionally using an existing command encoder.
+    ///
+    /// This method creates (or reuses) a cached compute pipeline, sets up bind groups,
+    /// and dispatches workgroups.
+    ///
+    /// If `encoder` is `Some(&mut encoder)`, the compute pass is recorded into the provided
+    /// encoder (no finish/submit is performed).
+    ///
+    /// If `encoder` is `None`, a new command encoder is created, used for the pass,
+    /// finished, and immediately submitted to the queue.
+    ///
+    /// ### SYNCHRONIZATION WARNING
+    /// Creating a new encoder (i.e. passing `None`) while other command encoders are still
+    /// open is **extremely dangerous**. It can cause GPU timeline desynchronization,
+    /// resource hazards, validation layer errors, crashes, or silent corruption if the
+    /// operations touch overlapping resources without explicit barriers.
+    ///
+    /// **ALWAYS prefer passing an existing encoder** when you're doing multiple
+    /// compute/render operations in the same frame. Only use `None` for isolated,
+    /// one-off dispatches.
+    ///
+    /// In debug builds, a loud runtime warning will be printed if you create a new
+    /// encoder while others are active.
+    ///
+    /// ## Bind group layout
+    /// - `@group(0)`: input textures + sampler
+    ///   - `binding 0..n`: input texture views
+    ///   - `binding n`: shared sampler
+    /// - `@group(1)`: output storage textures
+    ///   - `binding 0..m`: output texture views
+    /// - `@group(2)`: uniform/storage(read_write) buffers
+    ///   - `binding 0..k`: uniform/storage(read_write) buffers
+    ///
+    /// Empty input/output/uniform/storage(read_write) lists create empty bind groups for those slots.
+    ///
+    /// ## Texture handling
+    /// - MSAA input textures are auto-detected via `sample_count`
+    /// - Depth textures use depth sampling where applicable
+    ///
+    /// ## Parameters
+    /// - `encoder`: Optional existing encoder to record into
+    /// - `label`: Debug label for the encoder (if created) and compute pass
+    /// - `input_views`: Read-only input texture views
+    /// - `output_views`: Write-only storage texture views
+    /// - `shader_path`: Path to the WGSL compute shader
+    /// - `options`: Compute pipeline and dispatch configuration
+    /// - `buffers`: Optional uniform/storage(read_write) buffers
+    ///
+    /// ## Notes
+    /// - Shader entry point must be `main`
+    /// - Dispatch size comes from `options.dispatch_size`
+    ///
+    /// ## WGSL expectations
+    /// - Entry point: `@compute @workgroup_size(...) fn main()`
+    /// - Input textures must match the order given
+    /// - Output textures must be `texture_storage_2d<... , write>`
+    /// - Uniforms/Storage(read_write) must match binding indices exactly
+    ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
+    /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
+    /// standard WGSL before passing it to wgpu.
+    pub fn compute(
+        &mut self,
+        encoder: Option<&mut CommandEncoder>,
+        label: &str,
+        input_views: Vec<&TextureView>,
+        output_views: Vec<&TextureView>,
+        shader_path: &PathBuf,
+        options: ComputePipelineOptions,
+        buffers: &[&Buffer],
+    ) {
+        self.compute_system.compute(encoder, label, input_views, output_views, shader_path, options, buffers, &self.defines);
+    }
+
+    /// Enables or disables a compile-time shader define.
+    ///
+    /// This updates the internal set of shader `defines` used during WGSL
+    /// compilation. Defines control `#ifdef` / `#ifndef` blocks in shaders
+    /// and are evaluated **at shader compile time**, not at runtime.
+    ///
+    /// When a define is enabled:
+    /// - Shaders compiled afterward may select different code paths
+    /// - Binding layouts may change
+    /// - A new pipeline variant may be created
+    ///
+    /// When a define is disabled:
+    /// - The corresponding `#ifdef` blocks are excluded
+    ///
+    /// ### Important
+    ///
+    /// - Changing a define does **not** retroactively affect already-created
+    ///   pipelines or shader modules.
+    /// - Call this **before** compiling or requesting a pipeline that depends
+    ///   on the define.
+    /// - This is typically used for feature toggles such as MSAA, shadows,
+    ///   fog variants, or debug paths.
+    ///
+    /// ### Example
+    ///
+    /// ```text
+    /// update_define("MSAA".into(), true);
+    /// update_define("SSAO".into(), false);
+    /// ```
+    /// ## Used for:
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
+    /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
+    /// standard WGSL before passing it to wgpu.
+    pub fn update_define(&mut self, define: String, bool: bool) {
+        if bool {
+            self.defines.insert(define);
+        } else {
+            self.defines.remove(&define);
+        }
+    }
     /// Update parameters used for depth texture visualization.
     ///
     /// These parameters affect subsequent calls to
@@ -330,7 +468,7 @@ impl RenderManager {
     ///
     /// Useful for shader hot-reloading
     pub fn reload_render_shaders(&mut self, paths: &[PathBuf]) {
-        self.pipeline_cache.reload_shaders(paths);
+        self.pipeline_cache.reload_shaders(paths, &self.defines);
     }
 
     /// Reload procedural texture shaders and clear the texture cache.

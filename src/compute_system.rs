@@ -1,9 +1,10 @@
 // compute_system.rs
 #![allow(dead_code)]
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::path::{PathBuf};
 use wgpu::*;
+use crate::shader_preprocessing::compile_wgsl;
 
 /// Options for compute dispatch
 pub struct ComputePipelineOptions {
@@ -24,6 +25,7 @@ struct PipelineKey {
     input_specs: Vec<(TextureFormat, u32, bool)>, // (format, sample_count, is_filterable)
     output_formats: Vec<TextureFormat>,
     buffer_bindings: Vec<BufferBindingType>,
+    defines_hash: u64,
 }
 
 struct CachedPipeline {
@@ -95,64 +97,7 @@ impl ComputeSystem {
         }
     }
 
-    /// Execute a compute shader, optionally using an existing command encoder.
-    ///
-    /// This method creates (or reuses) a cached compute pipeline, sets up bind groups,
-    /// and dispatches workgroups.
-    ///
-    /// If `encoder` is `Some(&mut encoder)`, the compute pass is recorded into the provided
-    /// encoder (no finish/submit is performed).
-    ///
-    /// If `encoder` is `None`, a new command encoder is created, used for the pass,
-    /// finished, and immediately submitted to the queue.
-    ///
-    /// ### SYNCHRONIZATION WARNING
-    /// Creating a new encoder (i.e. passing `None`) while other command encoders are still
-    /// open is **extremely dangerous**. It can cause GPU timeline desynchronization,
-    /// resource hazards, validation layer errors, crashes, or silent corruption if the
-    /// operations touch overlapping resources without explicit barriers.
-    ///
-    /// **ALWAYS prefer passing an existing encoder** when you're doing multiple
-    /// compute/render operations in the same frame. Only use `None` for isolated,
-    /// one-off dispatches.
-    ///
-    /// In debug builds, a loud runtime warning will be printed if you create a new
-    /// encoder while others are active.
-    ///
-    /// ## Bind group layout
-    /// - `@group(0)`: input textures + sampler
-    ///   - `binding 0..n`: input texture views
-    ///   - `binding n`: shared sampler
-    /// - `@group(1)`: output storage textures
-    ///   - `binding 0..m`: output texture views
-    /// - `@group(2)`: uniform/storage(read_write) buffers
-    ///   - `binding 0..k`: uniform/storage(read_write) buffers
-    ///
-    /// Empty input/output/uniform/storage(read_write) lists create empty bind groups for those slots.
-    ///
-    /// ## Texture handling
-    /// - MSAA input textures are auto-detected via `sample_count`
-    /// - Depth textures use depth sampling where applicable
-    ///
-    /// ## Parameters
-    /// - `encoder`: Optional existing encoder to record into
-    /// - `label`: Debug label for the encoder (if created) and compute pass
-    /// - `input_views`: Read-only input texture views
-    /// - `output_views`: Write-only storage texture views
-    /// - `shader_path`: Path to the WGSL compute shader
-    /// - `options`: Compute pipeline and dispatch configuration
-    /// - `buffers`: Optional uniform/storage(read_write) buffers
-    ///
-    /// ## Notes
-    /// - Shader entry point must be `main`
-    /// - Dispatch size comes from `options.dispatch_size`
-    ///
-    /// ## WGSL expectations
-    /// - Entry point: `@compute @workgroup_size(...) fn main()`
-    /// - Input textures must match the order given
-    /// - Output textures must be `texture_storage_2d<... , write>`
-    /// - Uniforms/Storage(read_write) must match binding indices exactly
-    pub fn compute(
+    pub(crate) fn compute(
         &mut self,
         encoder: Option<&mut CommandEncoder>,
         label: &str,
@@ -161,6 +106,7 @@ impl ComputeSystem {
         shader_path: &PathBuf,
         options: ComputePipelineOptions,
         buffers: &[&Buffer],
+        variables: &HashSet<String>
     ) {
         let encoder_is_none = encoder.is_none();
         #[cfg(debug_assertions)]
@@ -204,6 +150,7 @@ impl ComputeSystem {
             input_specs: input_specs.clone(),
             output_formats: output_formats.clone(),
             buffer_bindings: buffer_bindings.clone(),
+            defines_hash: variables.hasher().build_hasher().finish(),
         };
 
         // Get or create cached pipeline
@@ -213,6 +160,7 @@ impl ComputeSystem {
                 &input_specs,
                 &output_formats,
                 &buffer_bindings,
+                variables
             );
 
             self.pipeline_cache.insert(key.clone(), cached);
@@ -291,14 +239,9 @@ impl ComputeSystem {
         input_specs: &[(TextureFormat, u32, bool)], // (format, sample_count, is_filterable)
         output_formats: &[TextureFormat],
         buffer_bindings: &[BufferBindingType],
+        variables: &HashSet<String>
     ) -> CachedPipeline {
-        let shader_source = fs::read_to_string(shader_path)
-            .unwrap_or_else(|_| panic!("Failed to read shader: {}", shader_path.display()));
-
-        let shader = self.device.create_shader_module(ShaderModuleDescriptor {
-            label: Some(shader_path.to_str().unwrap_or("")),
-            source: ShaderSource::Wgsl(shader_source.into()),
-        });
+        let shader = compile_wgsl(&self.device, shader_path, variables);
 
         // Determine if we can use filtering sampler
         let use_filtering = input_specs.iter().all(|(format, sample_count, is_filterable)| {

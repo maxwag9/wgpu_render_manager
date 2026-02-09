@@ -1,9 +1,10 @@
 // pipelines.rs
 #![allow(dead_code)]
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use wgpu::*;
+use crate::shader_preprocessing::compile_wgsl;
 
 /// Options required to enable shadow sampling in a render pipeline.
 ///
@@ -191,6 +192,7 @@ struct PipelineKey {
     depth_stencil: Option<DepthStencilKey>,
     cull_mode: Option<Face>,
     depth_only: bool,
+    defines_hash: u64,
 }
 
 struct ShaderEntry {
@@ -269,6 +271,7 @@ impl PipelineCache {
         shader_path: &Path,
         bind_group_layouts: &[&BindGroupLayout],
         options: &PipelineOptions,
+        defines: &HashSet<String>
     ) -> &RenderPipeline {
         let layout_hash = hash_layouts(bind_group_layouts, &options.vertex_layouts);
 
@@ -280,10 +283,11 @@ impl PipelineCache {
             depth_stencil: options.depth_stencil.as_ref().map(|d| d.into()),
             cull_mode: options.cull_mode,
             depth_only: options.vertex_only,
+            defines_hash: defines.hasher().build_hasher().finish()
         };
 
         if !self.pipelines.contains_key(&key) {
-            self.load_shader(shader_path);
+            self.load_shader(shader_path, defines);
             let pipeline = self.create_pipeline(&key, bind_group_layouts, options);
             self.pipelines.insert(key.clone(), pipeline);
         }
@@ -292,10 +296,10 @@ impl PipelineCache {
     }
 
     /// Reload shaders from disk. Pipelines using reloaded shaders will be recreated on next use.
-    pub(crate) fn reload_shaders(&mut self, paths: &[PathBuf]) {
+    pub(crate) fn reload_shaders(&mut self, paths: &[PathBuf], variables: &HashSet<String>) {
         for path in paths {
             if self.shaders.contains_key(path) {
-                self.load_shader(path);
+                self.load_shader(path, variables);
             }
         }
         self.pipelines.retain(|key, _| !paths.contains(&key.shader_path));
@@ -307,14 +311,8 @@ impl PipelineCache {
         self.pipelines.clear();
     }
 
-    fn load_shader(&mut self, path: &Path) {
-        let source = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to load shader {:?}: {}", path, e));
-
-        let module = self.device.create_shader_module(ShaderModuleDescriptor {
-            label: path.to_str(),
-            source: ShaderSource::Wgsl(source.into()),
-        });
+    fn load_shader(&mut self, path: &Path, defines: &HashSet<String>) {
+        let module = compile_wgsl(&self.device, path, defines);
 
         self.shaders.insert(path.to_path_buf(), ShaderEntry { module });
     }
