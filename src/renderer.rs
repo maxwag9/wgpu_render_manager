@@ -1,18 +1,24 @@
 use std::collections::{HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use wgpu::{BindGroup, BindGroupLayout, Buffer, CommandEncoder, Device, Queue, RenderPass, TextureView};
 use crate::bind_groups::{LayoutKey, MaterialBindGroups};
-use crate::compute_system::{ComputePipelineOptions, ComputeSystem};
+use crate::compute_system::{BufferSet, ComputePipelineOptions, ComputeSystem};
 use crate::fullscreen::{DebugVisualization, DepthDebugParams, FullscreenRenderer};
 use crate::generator::{TextureGenerator, TextureKey};
 use crate::pipelines::{PipelineCache, PipelineOptions};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
-struct UniformBindGroupKey(Vec<usize>);
+struct UniformBindGroupKey(u64);
 
 impl UniformBindGroupKey {
     fn from_buffers(buffers: &[&Buffer]) -> Self {
-        Self(buffers.iter().map(|b| *b as *const Buffer as usize).collect())
+        let mut hasher = DefaultHasher::default();
+        for buffer in buffers {
+            buffer.hash(&mut hasher);
+        }
+
+        Self(hasher.finish())
     }
 }
 
@@ -359,10 +365,10 @@ impl RenderManager {
     ///   - `binding n`: shared sampler
     /// - `@group(1)`: output storage textures
     ///   - `binding 0..m`: output texture views
-    /// - `@group(2)`: uniform/storage(read_write) buffers
-    ///   - `binding 0..k`: uniform/storage(read_write) buffers
+    /// - `@group(2)`: uniform/storage(read/read_write) buffers
+    ///   - `binding 0..k`: uniform/storage(read/read_write) buffers
     ///
-    /// Empty input/output/uniform/storage(read_write) lists create empty bind groups for those slots.
+    /// Empty input/output/uniform/storage(read/read_write) lists create empty bind groups for those slots.
     ///
     /// ## Texture handling
     /// - MSAA input textures are auto-detected via `sample_count`
@@ -375,7 +381,7 @@ impl RenderManager {
     /// - `output_views`: Write-only storage texture views
     /// - `shader_path`: Path to the WGSL compute shader
     /// - `options`: Compute pipeline and dispatch configuration
-    /// - `buffers`: Optional uniform/storage(read_write) buffers
+    /// - `buffer_sets`: Optional uniform/storage(read/read_write) buffers
     ///
     /// ## Notes
     /// - Shader entry point must be `main`
@@ -398,9 +404,9 @@ impl RenderManager {
         output_views: Vec<&TextureView>,
         shader_path: &PathBuf,
         options: ComputePipelineOptions,
-        buffers: &[&Buffer],
+        buffer_sets: &[BufferSet],
     ) {
-        self.compute_system.compute(encoder, label, input_views, output_views, shader_path, options, buffers, &self.defines);
+        self.compute_system.compute(encoder, label, input_views, output_views, shader_path, options, buffer_sets, &self.defines);
     }
 
     /// Enables or disables a compile-time shader define.

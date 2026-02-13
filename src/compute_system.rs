@@ -33,6 +33,34 @@ struct CachedPipeline {
     bind_group_layouts: [BindGroupLayout; 3],
 }
 
+#[derive(Debug)]
+pub struct BufferSet {
+    pub buffer: Buffer,
+    pub read_only: bool,
+}
+impl BufferSet {
+    pub fn from_uniform(uniform_buffer: &Buffer) -> Self {
+        if uniform_buffer.usage().contains(BufferUsages::UNIFORM) {
+            Self {
+                buffer: uniform_buffer.clone(),
+                read_only: false,
+            }
+        } else {
+            panic!("Buffer is not a uniform buffer in BufferSet::from_uniform()");
+        }
+    }
+    pub fn from_storage(storage_buffer: &Buffer, read_only: bool) -> Self {
+        if storage_buffer.usage().contains(BufferUsages::STORAGE) {
+            Self {
+                buffer: storage_buffer.clone(),
+                read_only,
+            }
+        } else {
+            panic!("Buffer is not a storage buffer in BufferSet::from_storage()");
+        }
+    }
+}
+
 /// High-level compute shader runner with automatic pipeline caching.
 ///
 /// `ComputeSystem` provides a structured way to execute compute shaders
@@ -105,7 +133,7 @@ impl ComputeSystem {
         output_views: Vec<&TextureView>,
         shader_path: &PathBuf,
         options: ComputePipelineOptions,
-        buffers: &[&Buffer],
+        buffer_sets: &[BufferSet],
         defines: &HashMap<String, bool>,
     ) {
         let encoder_is_none = encoder.is_none();
@@ -140,7 +168,7 @@ impl ComputeSystem {
             .collect();
 
         let output_formats: Vec<_> = output_views.iter().map(|v| v.texture().format()).collect();
-        let buffer_bindings: Vec<_> = buffers
+        let buffer_bindings: Vec<_> = buffer_sets
             .iter()
             .map(|b| buffer_binding_type(b))
             .collect();
@@ -175,7 +203,7 @@ impl ComputeSystem {
         // Create bind groups
         let input_bg = self.create_input_bind_group(&cached.bind_group_layouts[0], &input_views, use_filtering);
         let output_bg = self.create_output_bind_group(&cached.bind_group_layouts[1], &output_views);
-        let uniform_bg = self.create_buffer_bind_group(&cached.bind_group_layouts[2], buffers, Some("Compute Buffers Bind Group"));
+        let uniform_bg = self.create_buffer_bind_group(&cached.bind_group_layouts[2], buffer_sets, Some("Compute Buffers Bind Group"));
 
         // Resolve encoder (external or create new)
         let mut owned_encoder = None;
@@ -429,15 +457,15 @@ impl ComputeSystem {
     fn create_buffer_bind_group(
         &self,
         layout: &BindGroupLayout,
-        uniforms: &[&Buffer],
+        buffer_sets: &[BufferSet],
         label: Option<&str>,
     ) -> BindGroup {
-        let entries: Vec<BindGroupEntry> = uniforms
+        let entries: Vec<BindGroupEntry> = buffer_sets
             .iter()
             .enumerate()
-            .map(|(i, buffer)| BindGroupEntry {
+            .map(|(i, buffer_set)| BindGroupEntry {
                 binding: i as u32,
-                resource: buffer.as_entire_binding(),
+                resource: buffer_set.buffer.as_entire_binding(),
             })
             .collect();
 
@@ -489,17 +517,17 @@ pub(crate) fn figure_out_aspect(format: TextureFormat) -> Option<TextureAspect> 
         None
     }
 }
-fn buffer_binding_type(buffer: &Buffer) -> BufferBindingType {
-    let usage = buffer.usage();
+fn buffer_binding_type(buffer_set: &BufferSet) -> BufferBindingType {
+    let usage = buffer_set.buffer.usage();
 
     if usage.contains(BufferUsages::UNIFORM) {
         BufferBindingType::Uniform
     } else if usage.contains(BufferUsages::STORAGE) {
-        BufferBindingType::Storage { read_only: false }
+        BufferBindingType::Storage { read_only: buffer_set.read_only }
     } else {
         panic!(
             "Buffer {:?} has unsupported usage {:?} for compute binding",
-            buffer,
+            buffer_set,
             usage
         );
     }
