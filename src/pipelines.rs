@@ -1,6 +1,6 @@
 // pipelines.rs
 #![allow(dead_code)]
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use wgpu::*;
@@ -198,11 +198,15 @@ struct PipelineKey {
 struct ShaderEntry {
     module: ShaderModule,
 }
-
+#[derive(Hash, Eq, PartialEq)]
+struct ShaderKey {
+    shader_path: PathBuf,
+    defines_hash: u64,
+}
 /// Caches render pipelines to avoid redundant creation.
 pub struct PipelineCache {
     device: Device,
-    shaders: HashMap<PathBuf, ShaderEntry>,
+    shaders: HashMap<ShaderKey, ShaderEntry>,
     pipelines: HashMap<PipelineKey, RenderPipeline>,
     pub(crate) uniform_layouts: HashMap<usize, BindGroupLayout>,
 }
@@ -271,7 +275,7 @@ impl PipelineCache {
         shader_path: &Path,
         bind_group_layouts: &[&BindGroupLayout],
         options: &PipelineOptions,
-        defines: &HashSet<String>
+        defines: &HashMap<String, bool>,
     ) -> &RenderPipeline {
         let layout_hash = hash_layouts(bind_group_layouts, &options.vertex_layouts);
 
@@ -288,7 +292,7 @@ impl PipelineCache {
 
         if !self.pipelines.contains_key(&key) {
             self.load_shader(shader_path, defines);
-            let pipeline = self.create_pipeline(&key, bind_group_layouts, options);
+            let pipeline = self.create_pipeline(&key, bind_group_layouts, options, defines);
             self.pipelines.insert(key.clone(), pipeline);
         }
 
@@ -296,10 +300,14 @@ impl PipelineCache {
     }
 
     /// Reload shaders from disk. Pipelines using reloaded shaders will be recreated on next use.
-    pub(crate) fn reload_shaders(&mut self, paths: &[PathBuf], variables: &HashSet<String>) {
+    pub(crate) fn reload_shaders(&mut self, paths: &[PathBuf], defines: &HashMap<String, bool>) {
         for path in paths {
-            if self.shaders.contains_key(path) {
-                self.load_shader(path, variables);
+            let shader_key = ShaderKey {
+                shader_path: path.clone(),
+                defines_hash: defines.hasher().build_hasher().finish()
+            };
+            if self.shaders.contains_key(&shader_key) {
+                self.load_shader(path, defines);
             }
         }
         self.pipelines.retain(|key, _| !paths.contains(&key.shader_path));
@@ -311,10 +319,16 @@ impl PipelineCache {
         self.pipelines.clear();
     }
 
-    fn load_shader(&mut self, path: &Path, defines: &HashSet<String>) {
+    fn load_shader(&mut self, path: &Path, defines: &HashMap<String, bool>) {
+        let shader_key = ShaderKey {
+            shader_path: path.to_path_buf(),
+            defines_hash: defines.hasher().build_hasher().finish()
+        };
+        if self.shaders.contains_key(&shader_key) {
+            return;
+        }
         let module = compile_wgsl(&self.device, path, defines);
-
-        self.shaders.insert(path.to_path_buf(), ShaderEntry { module });
+        self.shaders.insert(shader_key, ShaderEntry { module });
     }
 
     fn create_pipeline(
@@ -322,8 +336,13 @@ impl PipelineCache {
         key: &PipelineKey,
         bind_group_layouts: &[&BindGroupLayout],
         options: &PipelineOptions,
+        defines: &HashMap<String, bool>,
     ) -> RenderPipeline {
-        let shader = &self.shaders.get(&key.shader_path).unwrap().module;
+        let shader_key = ShaderKey {
+            shader_path: key.shader_path.clone(),
+            defines_hash: defines.hasher().build_hasher().finish()
+        };
+        let shader = &self.shaders.get(&shader_key).unwrap().module;
 
         let pipeline_layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some(&format!("{} layout", key.shader_path.display())),
@@ -376,19 +395,11 @@ impl PipelineCache {
 fn hash_layouts(bgls: &[&BindGroupLayout], vertex_layouts: &[VertexBufferLayout]) -> u64 {
     let mut hasher = DefaultHasher::new();
 
-    for bgl in bgls {
-        (*bgl as *const BindGroupLayout as usize).hash(&mut hasher);
+    for &bgl in bgls {
+        bgl.hash(&mut hasher); // stable: hashes the wgpu id, not the stack address IMPORTANT, would be an *INSANE* bug!
     }
-
-    for layout in vertex_layouts {
-        layout.array_stride.hash(&mut hasher);
-        (layout.step_mode as u32).hash(&mut hasher);
-        for attr in layout.attributes {
-            attr.shader_location.hash(&mut hasher);
-            attr.offset.hash(&mut hasher);
-            (attr.format as u32).hash(&mut hasher);
-        }
+    for vl in vertex_layouts {
+        vl.hash(&mut hasher); // stable: hashes the wgpu id, not the stack address IMPORTANT, would be an *INSANE* bug!
     }
-
     hasher.finish()
 }

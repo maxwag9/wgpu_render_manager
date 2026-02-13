@@ -1,6 +1,6 @@
 // compute_system.rs
 #![allow(dead_code)]
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::hash::{BuildHasher, Hasher};
 use std::path::{PathBuf};
 use wgpu::*;
@@ -106,7 +106,7 @@ impl ComputeSystem {
         shader_path: &PathBuf,
         options: ComputePipelineOptions,
         buffers: &[&Buffer],
-        variables: &HashSet<String>
+        defines: &HashMap<String, bool>,
     ) {
         let encoder_is_none = encoder.is_none();
         #[cfg(debug_assertions)]
@@ -150,7 +150,7 @@ impl ComputeSystem {
             input_specs: input_specs.clone(),
             output_formats: output_formats.clone(),
             buffer_bindings: buffer_bindings.clone(),
-            defines_hash: variables.hasher().build_hasher().finish(),
+            defines_hash: defines.hasher().build_hasher().finish(),
         };
 
         // Get or create cached pipeline
@@ -160,7 +160,7 @@ impl ComputeSystem {
                 &input_specs,
                 &output_formats,
                 &buffer_bindings,
-                variables
+                defines
             );
 
             self.pipeline_cache.insert(key.clone(), cached);
@@ -175,7 +175,7 @@ impl ComputeSystem {
         // Create bind groups
         let input_bg = self.create_input_bind_group(&cached.bind_group_layouts[0], &input_views, use_filtering);
         let output_bg = self.create_output_bind_group(&cached.bind_group_layouts[1], &output_views);
-        let uniform_bg = self.create_uniform_bind_group(&cached.bind_group_layouts[2], buffers);
+        let uniform_bg = self.create_buffer_bind_group(&cached.bind_group_layouts[2], buffers, Some("Compute Buffers Bind Group"));
 
         // Resolve encoder (external or create new)
         let mut owned_encoder = None;
@@ -239,9 +239,9 @@ impl ComputeSystem {
         input_specs: &[(TextureFormat, u32, bool)], // (format, sample_count, is_filterable)
         output_formats: &[TextureFormat],
         buffer_bindings: &[BufferBindingType],
-        variables: &HashSet<String>
+        defines: &HashMap<String, bool>,
     ) -> CachedPipeline {
-        let shader = compile_wgsl(&self.device, shader_path, variables);
+        let shader = compile_wgsl(&self.device, shader_path, defines);
 
         // Determine if we can use filtering sampler
         let use_filtering = input_specs.iter().all(|(format, sample_count, is_filterable)| {
@@ -426,10 +426,11 @@ impl ComputeSystem {
         })
     }
 
-    fn create_uniform_bind_group(
+    fn create_buffer_bind_group(
         &self,
         layout: &BindGroupLayout,
         uniforms: &[&Buffer],
+        label: Option<&str>,
     ) -> BindGroup {
         let entries: Vec<BindGroupEntry> = uniforms
             .iter()
@@ -441,7 +442,7 @@ impl ComputeSystem {
             .collect();
 
         self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute_uniform_bg"),
+            label,
             layout,
             entries: &entries,
         })

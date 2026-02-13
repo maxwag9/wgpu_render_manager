@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::path::{Path, PathBuf};
 use wgpu::{BindGroup, BindGroupLayout, Buffer, CommandEncoder, Device, Queue, RenderPass, TextureView};
 use crate::bind_groups::{LayoutKey, MaterialBindGroups};
@@ -51,7 +51,7 @@ pub struct RenderManager {
     materials: MaterialBindGroups,
     compute_system: ComputeSystem,
     uniform_bind_groups: HashMap<UniformBindGroupKey, BindGroup>,
-    defines: HashSet<String>
+    defines: HashMap<String, bool>,
 }
 
 impl RenderManager {
@@ -79,7 +79,7 @@ impl RenderManager {
             materials,
             compute_system,
             uniform_bind_groups: HashMap::new(),
-            defines: HashSet::new(),
+            defines: HashMap::new(),
         }
     }
 
@@ -436,13 +436,7 @@ impl RenderManager {
     /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
     /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
     /// standard WGSL before passing it to wgpu.
-    pub fn update_define(&mut self, define: String, bool: bool) {
-        if bool {
-            self.defines.insert(define);
-        } else {
-            self.defines.remove(&define);
-        }
-    }
+    pub fn update_define(&mut self, define: String, enabled: bool) { self.defines.insert(define, enabled); }
     /// Update parameters used for depth texture visualization.
     ///
     /// These parameters affect subsequent calls to

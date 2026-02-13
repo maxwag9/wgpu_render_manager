@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap};
 use std::path::Path;
 use wgpu::{Device, ShaderModule, ShaderModuleDescriptor, ShaderSource};
 
@@ -75,62 +75,138 @@ use wgpu::{Device, ShaderModule, ShaderModuleDescriptor, ShaderSource};
 /// ### Panics
 ///
 /// Panics if the shader file or any included file cannot be read.
-pub(crate) fn compile_wgsl(
+/// Also panics if any point of the preprocessing fails or the define doesn't exist if defined in the shader.
+pub fn compile_wgsl(
     device: &Device,
     path: &Path,
-    defines: &HashSet<String>,
+    defines: &HashMap<String, bool>,
 ) -> ShaderModule {
-    let source = std::fs::read_to_string(path).unwrap();
-    let processed = preprocess_wgsl(path, &source, defines);
+    let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("Failed to read shader file {}: {}", path.display(), e)
+    });
+
+    let mut conditional_stack: Vec<bool> = vec![];
+    let processed = preprocess_wgsl(path, &source, defines, &mut conditional_stack);
+
+    if !conditional_stack.is_empty() {
+        panic!(
+            "Unbalanced preprocessing directives in shader {} (or one of its #included files): open #ifdef/#ifndef without matching #endif",
+            path.display()
+        );
+    }
+
+    let label_str = path
+        .to_str()
+        .unwrap_or_else(|| panic!("Shader path {} is not valid UTF-8", path.display()));
+
     device.create_shader_module(ShaderModuleDescriptor {
-        label: Some(path.to_str().unwrap()),
+        label: Some(label_str),
         source: ShaderSource::Wgsl(processed.into()),
     })
 }
 
 fn preprocess_wgsl(
-    base: &Path,
+    path: &Path,
     src: &str,
-    defines: &HashSet<String>,
+    defines: &HashMap<String, bool>,
+    stack: &mut Vec<bool>,
 ) -> String {
-    let mut stack: Vec<bool> = vec![];
-
-    src.lines()
-        .flat_map(|line| {
+    let processed_lines: Vec<String> = src
+        .lines()
+        .enumerate()
+        .flat_map(|(i, line)| {
+            let line_num = i + 1;
             let t = line.trim();
 
-            if let Some(k) = t.strip_prefix("#ifdef ") {
-                stack.push(defines.contains(k.trim()));
-                return None;
+            // --- #ifdef ---
+            if let Some(rest) = t.strip_prefix("#ifdef ") {
+                let name = rest.trim();
+                let value = *defines.get(name).expect(&format!(
+                    "{}:{}: Unknown preprocessing define '{}' in #ifdef",
+                    path.display(),
+                    line_num,
+                    name
+                ));
+                stack.push(value);
+                return vec![];
             }
-            if let Some(k) = t.strip_prefix("#ifndef ") {
-                stack.push(!defines.contains(k.trim()));
-                return None;
+
+            // --- #ifndef ---
+            if let Some(rest) = t.strip_prefix("#ifndef ") {
+                let name = rest.trim();
+                let value = *defines.get(name).expect(&format!(
+                    "{}:{}: Unknown preprocessing define '{}' in #ifndef",
+                    path.display(),
+                    line_num,
+                    name
+                ));
+                stack.push(!value);
+                return vec![];
             }
+
+            // --- #else ---
             if t.starts_with("#else") {
-                let v = stack.last_mut().unwrap();
+                let v = stack.last_mut().expect(&format!(
+                    "{}:{}: #else without matching #ifdef/#ifndef",
+                    path.display(),
+                    line_num
+                ));
                 *v = !*v;
-                return None;
+                return vec![];
             }
+
+            // --- #endif ---
             if t.starts_with("#endif") {
-                stack.pop();
-                return None;
+                if stack.pop().is_none() {
+                    panic!(
+                        "{}:{}: #endif without matching #ifdef/#ifndef",
+                        path.display(),
+                        line_num
+                    );
+                }
+                return vec![];
             }
 
-            if stack.iter().any(|v| !*v) {
-                return None;
+            // --- Skip lines in inactive blocks ---
+            if stack.iter().any(|&v| !v) {
+                return vec![];
             }
 
-            if let Some(p) = t.strip_prefix("#include \"") {
-                let p = p.strip_suffix('"').unwrap();
-                let mut inc = base.parent().unwrap().to_path_buf();
-                inc.push(p);
-                let s = std::fs::read_to_string(&inc).unwrap();
-                return Some(preprocess_wgsl(&inc, &s, defines));
+            // --- #include ---
+            if let Some(rest) = t.strip_prefix("#include \"") {
+                let p = rest.strip_suffix('"').expect(&format!(
+                    "{}:{}: Malformed #include directive: missing closing quote",
+                    path.display(),
+                    line_num
+                ));
+
+                let parent = path.parent().expect("Cannot resolve relative #include: shader path has no parent directory");
+                let mut inc_path = parent.to_path_buf();
+                inc_path.push(p);
+
+                let inc_source = std::fs::read_to_string(&inc_path).unwrap_or_else(|e| {
+                    panic!(
+                        "{}:{}: Failed to read included shader \"{}\" (resolved to {}): {}",
+                        path.display(),
+                        line_num,
+                        p,
+                        inc_path.display(),
+                        e
+                    );
+                });
+
+                let inc_processed = preprocess_wgsl(&inc_path, &inc_source, defines, stack);
+
+                return inc_processed
+                    .lines()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
             }
 
-            Some(line.to_string())
+            // --- Normal line ---
+            vec![line.to_string()]
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+
+    processed_lines.join("\n") + "\n"
 }
