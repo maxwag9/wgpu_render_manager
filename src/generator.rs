@@ -33,6 +33,109 @@ use std::path::PathBuf;
 use wgpu::util::DeviceExt;
 use wgpu::{Device, Queue, TextureView};
 
+pub const NOTEX_SHADER: &str = r#"
+// notex.wgsl - "No Texture" placeholder texture
+struct Params {
+    color_primary: vec4<f32>,
+    color_secondary: vec4<f32>,
+    seed: u32,
+    scale: f32,
+    roughness: f32,
+    moisture: f32,
+    shadow_strength: f32,
+    sheen_strength: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+
+@group(0) @binding(0) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+// 5x7 bitmap font - returns 1.0 if pixel is lit
+// Rows are encoded as 5-bit values, bit 4 = leftmost pixel
+fn get_pixel(char_id: i32, x: i32, y: i32) -> f32 {
+    if (x < 0 || x > 4 || y < 0 || y > 6) { return 0.0; }
+
+    var rows: array<u32, 7>;
+    switch char_id {
+        case 0: { // N
+            rows = array<u32, 7>(17u, 17u, 17u, 19u, 21u, 25u, 17u);
+        }
+        case 1: { // O
+            rows = array<u32, 7>(14u, 17u, 17u, 17u, 17u, 17u, 14u);
+        }
+        case 2: { // T
+            rows = array<u32, 7>(4u, 4u, 4u, 4u, 4u, 4u, 31u);
+        }
+        case 3: { // E
+            rows = array<u32, 7>(31u, 16u, 16u, 30u, 16u, 16u, 31u);
+        }
+        case 4: { // X
+            rows = array<u32, 7>(17u, 10u, 4u, 4u, 4u, 10u, 17u);
+        }
+        default: {
+            return 0.0;
+        }
+    }
+
+    return f32((rows[y] >> u32(4 - x)) & 1u);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let size = textureDimensions(output);
+    if (gid.x >= size.x || gid.y >= size.y) {
+        return;
+    }
+
+    let uv = vec2<f32>(f32(gid.x), f32(gid.y)) / vec2<f32>(f32(size.x), f32(size.y));
+
+    // Checkerboard background
+    let checker_size = 8.0;
+    let cx = i32(floor(uv.x * checker_size));
+    let cy = i32(floor(uv.y * checker_size));
+    let checker = ((cx + cy) % 2) == 0;
+    var bg_color = params.color_primary.rgb;
+    if (checker) {
+        bg_color *= 0.7;
+    }
+
+    // Text layout: "NOTEX" - 5 chars, each 5px wide + 2px spacing
+    let text_width = 33.0;  // 5*5 + 4*2
+    let text_height = 7.0;
+    let char_width = 5.0;
+    let char_spacing = 2.0;
+    let char_pitch = char_width + char_spacing;
+
+    // Scale text to fit ~60% of texture width
+    let scale = f32(min(size.x, size.y)) * 0.6 / text_width;
+
+    // Map UV to text coordinates, centered
+    let center = vec2<f32>(0.5, 0.5);
+    let text_uv = (uv - center) * vec2<f32>(f32(size.x), f32(size.y)) / scale;
+
+    // Convert to text grid coords with (0,0) at bottom-left of text block
+    let tx = text_uv.x + text_width * 0.5;
+    let ty = -text_uv.y + text_height * 0.5;  // Flip Y for correct orientation
+
+    // Determine which character and local position
+    let char_idx = i32(floor(tx / char_pitch));
+    let local_x = i32(tx - f32(char_idx) * char_pitch);
+    let local_y = i32(ty);
+
+    // Sample text (only if within character bounds, not spacing)
+    var text = 0.0;
+    if (local_x < i32(char_width) && char_idx >= 0 && char_idx < 5) {
+        text = get_pixel(char_idx, local_x, local_y);
+    }
+
+    // Final color
+    let color = mix(bg_color, params.color_secondary.rgb, text);
+
+    textureStore(output, vec2<i32>(gid.xy), vec4(color, 1.0));
+}
+"#;
+
 /// Parameters passed to procedural texture generation shaders.
 ///
 /// This struct is uploaded to the GPU as a uniform buffer and must
@@ -65,8 +168,8 @@ pub struct TextureParams {
 impl Default for TextureParams {
     fn default() -> Self {
         Self {
-            color_primary: [1.0, 1.0, 1.0, 1.0],
-            color_secondary: [0.0, 0.0, 0.0, 1.0],
+            color_primary: [0.0, 0.0, 0.0, 1.0],   // Black
+            color_secondary: [1.0, 0.0, 1.0, 1.0], // Magenta
             seed: 0,
             scale: 1.0,
             roughness: 0.5,
@@ -177,6 +280,13 @@ impl TextureKey {
             resolution,
         }
     }
+    pub fn notex() -> Self {
+        Self {
+            shader_id: "notex".to_string(),
+            params: TextureParams::default(),
+            resolution: 128,
+        }
+    }
 }
 
 struct CachedTexture {
@@ -274,14 +384,20 @@ impl TextureGenerator {
             return;
         }
 
-        let shader_path = self.shader_dir.join(format!("{}.wgsl", shader_id.to_lowercase()));
-        let shader_source = std::fs::read_to_string(&shader_path)
-            .unwrap_or_else(|e| panic!("Failed to read shader {:?}: {}", shader_path, e));
-
-        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(shader_id),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-        });
+        let shader_module = if shader_id == "notex" {
+            self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(shader_id),
+                source: wgpu::ShaderSource::Wgsl(NOTEX_SHADER.into()),
+            })
+        } else {
+            let shader_path = self.shader_dir.join(format!("{}.wgsl", shader_id.to_lowercase()));
+            let shader_source = std::fs::read_to_string(&shader_path)
+                .unwrap_or_else(|e| panic!("Failed to read shader {:?}: {}", shader_path, e));
+            self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(shader_id),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            })
+        };
 
         let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(&format!("{} bind group layout", shader_id)),

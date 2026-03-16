@@ -335,6 +335,19 @@ impl RenderManager {
         self.fullscreen.render(texture, visualization_type, target_view, pass);
     }
 
+    pub fn render_fullscreen_debug_texture(
+        &mut self,
+        texture_key: &TextureKey,
+        visualization_type: DebugVisualization,
+        target_view: &TextureView,
+        pass: &mut RenderPass,
+    ) {
+        // Cloning TextureView is cheap — it's just a handle to the underlying GPU object.
+        let texture_view = &self.generator.get_or_create(texture_key).clone();
+
+        self.fullscreen.render(texture_view, visualization_type, target_view, pass);
+    }
+
     /// Execute a compute shader, optionally using an existing command encoder.
     ///
     /// This method creates (or reuses) a cached compute pipeline, sets up bind groups,
