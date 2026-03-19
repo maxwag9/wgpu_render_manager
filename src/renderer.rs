@@ -269,7 +269,7 @@ impl RenderManager {
         }
 
         // Local references only
-        let bind_group_layout_refs: Vec<&BindGroupLayout> = owned_bgls.iter().collect();
+        let bind_group_layout_refs: Vec<Option<&BindGroupLayout>> = owned_bgls.iter().map(|bgl| Some(bgl)).collect::<Vec<_>>();
 
         // Pipeline
         let pipeline_ref = self
@@ -309,7 +309,7 @@ impl RenderManager {
         options: &PipelineOptions,
         pass: &mut RenderPass,
     ) {
-        let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts, options, &self.defines);
+        let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts.iter().map(|bgl| Some(*bgl)).collect::<Vec<_>>().as_slice(), options, &self.defines);
         pass.set_pipeline(pipeline);
 
         for (i, bg) in bind_groups.iter().enumerate() {
@@ -317,6 +317,24 @@ impl RenderManager {
         }
     }
 
+    /// Render using fully custom bind group layouts and bind groups with holes.
+    ///
+    /// Same as [`render_with_layouts()`](crate::renderer::RenderManager::render_with_layouts), but allows holes in the bind group layouts since wgpu 29.0.0 allows this.
+    pub fn render_with_layouts_holed(
+        &mut self,
+        shader_path: &Path,
+        bind_group_layouts: &[Option<&BindGroupLayout>],
+        bind_groups: &[&BindGroup],
+        options: &PipelineOptions,
+        pass: &mut RenderPass,
+    ) {
+        let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts, options, &self.defines);
+        pass.set_pipeline(pipeline);
+
+        for (i, bg) in bind_groups.iter().enumerate() {
+            pass.set_bind_group(i as u32, *bg, &[]);
+        }
+    }
     /// Render a fullscreen debug visualization of a texture.
     ///
     /// This is primarily intended for inspecting intermediate render

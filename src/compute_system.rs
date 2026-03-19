@@ -395,7 +395,7 @@ impl ComputeSystem {
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("compute_pipeline_layout"),
-                bind_group_layouts: &bind_group_layouts.iter().collect::<Vec<_>>(),
+                bind_group_layouts: &bind_group_layouts.iter().map(|bgl| Some(bgl)).collect::<Vec<_>>(),
                 immediate_size: 0,
             });
 

@@ -28,6 +28,22 @@ pub struct ShadowOptions {
     pub view: TextureView,
 }
 
+#[derive(Clone, Debug)]
+pub enum FragmentOption {
+    /// The pipeline is created without a Fragment stage.
+    ///
+    /// Useful for depth-only or shadow-map rendering.
+    None,
+    /// The pipeline is created with a Fragment stage
+    Default {
+        /// targets: Color target states for the fragment shader outputs.
+        /// The length of this vector must match the number of render targets.
+        targets: Vec<Option<ColorTargetState>>,
+    },
+    /// Completely custom Fragment stage
+    Custom(FragmentState<'static>),
+}
+
 /// Configuration object for creating a render pipeline.
 ///
 /// `PipelineOptions` describes fixed-function and layout-related state
@@ -73,15 +89,8 @@ pub struct PipelineOptions {
     /// Optional face culling mode.
     pub cull_mode: Option<Face>,
 
-    /// Color target states for the fragment shader outputs.
-    ///
-    /// The length of this vector must match the number of render targets.
-    pub targets: Vec<Option<ColorTargetState>>,
-
-    /// If true, the pipeline is created without a fragment stage.
-    ///
-    /// Useful for depth-only or shadow-map rendering.
-    pub vertex_only: bool,
+    /// Options for the Fragment Stage
+    pub fragment: FragmentOption,
 
     /// Optional shadow sampling configuration.
     pub shadow: Option<ShadowOptions>,
@@ -105,8 +114,7 @@ impl Default for PipelineOptions {
             depth_stencil: None,
             vertex_layouts: vec![],
             cull_mode: None,
-            targets: vec![],
-            vertex_only: false,
+            fragment: FragmentOption::Default {targets: vec![]},
             shadow: None,
         }
     }
@@ -152,8 +160,19 @@ impl PipelineOptions {
     ///
     /// The order of targets must match the fragment shader outputs.
     pub fn with_target(mut self, target: ColorTargetState) -> Self {
-        self.targets.push(Some(target));
-        self
+        match &mut self.fragment {
+            FragmentOption::None => {
+                self.fragment = FragmentOption::Default {targets: vec![Some(target)]};
+                self
+            }
+            FragmentOption::Default { targets } => {
+                targets.push(Some(target));
+                self
+            }
+            FragmentOption::Custom(_) => {
+                self
+            }
+        }
     }
 
     /// Configures the pipeline as vertex-only.
@@ -161,7 +180,7 @@ impl PipelineOptions {
     /// This disables the fragment stage entirely and is typically used
     /// for depth-only or shadow-map passes.
     pub fn depth_only(mut self) -> Self {
-        self.vertex_only = true;
+        self.fragment = FragmentOption::None;
         self
     }
 }
@@ -177,8 +196,8 @@ impl From<&DepthStencilState> for DepthStencilKey {
     fn from(d: &DepthStencilState) -> Self {
         Self {
             format: d.format,
-            depth_write_enabled: d.depth_write_enabled,
-            depth_compare: d.depth_compare,
+            depth_write_enabled: d.depth_write_enabled.unwrap_or(false),
+            depth_compare: d.depth_compare.unwrap_or(CompareFunction::Always),
         }
     }
 }
@@ -191,7 +210,7 @@ struct PipelineKey {
     msaa_samples: u32,
     depth_stencil: Option<DepthStencilKey>,
     cull_mode: Option<Face>,
-    depth_only: bool,
+    fragment_hash: u64,
     defines_hash: u64,
 }
 
@@ -273,7 +292,7 @@ impl PipelineCache {
     pub(crate) fn get_or_create(
         &mut self,
         shader_path: &Path,
-        bind_group_layouts: &[&BindGroupLayout],
+        bind_group_layouts: &[Option<&BindGroupLayout>],
         options: &PipelineOptions,
         defines: &HashMap<String, bool>,
     ) -> &RenderPipeline {
@@ -286,7 +305,7 @@ impl PipelineCache {
             msaa_samples: options.msaa_samples,
             depth_stencil: options.depth_stencil.as_ref().map(|d| d.into()),
             cull_mode: options.cull_mode,
-            depth_only: options.vertex_only,
+            fragment_hash: hash_fragment(&options.fragment),
             defines_hash: hash_defines(defines)
         };
 
@@ -334,7 +353,7 @@ impl PipelineCache {
     fn create_pipeline(
         &self,
         key: &PipelineKey,
-        bind_group_layouts: &[&BindGroupLayout],
+        bind_group_layouts: &[Option<&BindGroupLayout>],
         options: &PipelineOptions,
         defines: &HashMap<String, bool>,
     ) -> RenderPipeline {
@@ -350,15 +369,19 @@ impl PipelineCache {
             immediate_size: 0,
         });
 
-        let fragment = if options.vertex_only {
-            None
-        } else {
-            Some(FragmentState {
-                module: shader,
-                entry_point: Some("fs_main"),
-                targets: &options.targets.iter().cloned().collect::<Vec<_>>(),
-                compilation_options: Default::default(),
-            })
+        let fragment = match &options.fragment {
+            FragmentOption::None => None,
+
+            FragmentOption::Default { targets } => {
+                Some(FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &targets,
+                    compilation_options: Default::default(),
+                })
+            }
+
+            FragmentOption::Custom(f) => Some(f.clone()),
         };
 
         self.device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -392,11 +415,70 @@ impl PipelineCache {
     }
 }
 
-fn hash_layouts(bgls: &[&BindGroupLayout], vertex_layouts: &[VertexBufferLayout]) -> u64 {
+fn hash_fragment(fragment: &FragmentOption) -> u64 {
+    let mut hasher = DefaultHasher::new();
+
+    match fragment {
+        FragmentOption::None => {
+            0u8.hash(&mut hasher); // discriminant
+        }
+
+        FragmentOption::Default { targets } => {
+            1u8.hash(&mut hasher); // discriminant
+            hash_targets(&mut hasher, targets);
+        }
+
+        FragmentOption::Custom(f) => {
+            2u8.hash(&mut hasher); // discriminant
+            f.entry_point.hash(&mut hasher);
+            f.module.hash(&mut hasher);
+            hash_targets(&mut hasher, f.targets);
+        }
+    }
+
+    hasher.finish()
+}
+
+fn hash_targets(hasher: &mut impl Hasher, targets: &[Option<ColorTargetState>]) {
+    targets.len().hash(hasher);
+    for target in targets {
+        match target {
+            Some(state) => {
+                true.hash(hasher);
+                state.format.hash(hasher);
+                hash_blend_state(hasher, &state.blend);
+                state.write_mask.bits().hash(hasher);
+            }
+            None => {
+                false.hash(hasher);
+            }
+        }
+    }
+}
+
+fn hash_blend_state(hasher: &mut impl Hasher, blend: &Option<BlendState>) {
+    match blend {
+        Some(b) => {
+            true.hash(hasher);
+            // BlendComponent fields
+            b.color.src_factor.hash(hasher);
+            b.color.dst_factor.hash(hasher);
+            b.color.operation.hash(hasher);
+            b.alpha.src_factor.hash(hasher);
+            b.alpha.dst_factor.hash(hasher);
+            b.alpha.operation.hash(hasher);
+        }
+        None => {
+            false.hash(hasher);
+        }
+    }
+}
+
+fn hash_layouts(bgls: &[Option<&BindGroupLayout>], vertex_layouts: &[VertexBufferLayout]) -> u64 {
     let mut hasher = DefaultHasher::new();
 
     for &bgl in bgls {
-        bgl.hash(&mut hasher); // stable: hashes the wgpu id, not the stack address IMPORTANT, would be an *INSANE* bug!
+        bgl.hash(&mut hasher); // stable: hashes the wgpu id, not the stack address IMPORTANT, would be an *INSANE* bug! Option<> Hashing works fine
     }
     for vl in vertex_layouts {
         vl.hash(&mut hasher); // stable: hashes the wgpu id, not the stack address IMPORTANT, would be an *INSANE* bug!

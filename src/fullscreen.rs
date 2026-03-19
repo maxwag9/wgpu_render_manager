@@ -892,10 +892,10 @@ impl FullscreenRenderer {
         };
 
         // LinearDepth also needs depth_params_bgl for the far plane value
-        let bind_group_layouts: Vec<&BindGroupLayout> = if kind == PipelineKind::Depth || kind == PipelineKind::LinearDepth {
-            vec![bgl, &self.depth_params_bgl]
+        let bind_group_layouts: Vec<Option<&BindGroupLayout>> = if kind == PipelineKind::Depth || kind == PipelineKind::LinearDepth {
+            vec![Some(bgl), Some(&self.depth_params_bgl)]
         } else {
-            vec![bgl]
+            vec![Some(bgl)]
         };
 
         let layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor {
