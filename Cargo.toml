@@ -1,6 +1,6 @@
 [package]
 name = "wgpu_render_manager"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 
 authors = ["Maxim Wagner"]
@@ -14,6 +14,6 @@ keywords = ["wgpu", "graphics", "rendering", "compute", "gpu"]
 categories = ["graphics", "rendering", "game-development"]
 
 [dependencies]
-wgpu = "29.0.0"
+wgpu = "29.0.1"
 bytemuck = "^1.12.0"
-
+serde = { version = "^1.0.228", features = ["derive"] }
