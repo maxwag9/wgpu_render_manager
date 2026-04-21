@@ -228,7 +228,6 @@ impl RenderManager {
     ///     &mut render_pass,          // Render Pass
     /// );
     /// ```
-
     pub fn render_with_textures(
         &mut self,
         texture_views: &[&TextureView],
@@ -317,6 +316,116 @@ impl RenderManager {
         }
     }
 
+    /// Render using pre-existing texture views and manual bind groups.
+    ///
+    /// Use this when textures originate from sources other than the
+    /// procedural texture generator, such as render targets or external
+    /// textures.
+    ///
+    /// Render using custom bind group layouts and bind groups.
+    ///
+    /// This method automatically:
+    /// - Creates or reuses a material bind group
+    /// - Sets up optional shadow bindings
+    /// - Handles uniform bind groups if provided
+    ///
+    /// Like [`render`](Self::render), this does not issue a draw call.
+    ///
+    /// ## Shader Binding layout
+    /// - `@group(0) @binding(0)`: trilinear sampler
+    /// - `@group(0) @binding(0..n)`: textures as texture_2d<f32> or texture_multisampled_2d<f32>
+    /// - `@group(0) @binding(n+1)`: (optional) shadow_sampler
+    /// - `@group(0) @binding(n+2)`: (optional) shadow textures as texture_depth_2d_array
+    /// - `@group(1) @binding(0..n)`: uniforms, in the same order as input
+    /// - `@group(2..n) @binding(0..n)`: Manual Bind groups
+    ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small
+    /// compile-time preprocessing layer (`#ifdef`, `#include`) on top of
+    /// standard WGSL before passing it to wgpu.
+    ///
+    /// ## Example
+    /// ```no_run
+    /// // Inside a render pass
+    /// render_manager.render_with_layouts_and_textures(
+    ///     &texture_views.as_slice(), // Texture Views
+    ///     shader_path.as_path(),     // Shader Path
+    ///     bind_group_layouts,        // BGLs
+    ///     bind_groups,               // BGs
+    ///     options,                   // Pipeline Options
+    ///     &[&uniforms_buffer],       // Buffers
+    ///     &mut render_pass,          // Render Pass
+    /// );
+    /// ```
+    pub fn render_with_layouts_and_textures(
+        &mut self,
+        texture_views: &[&TextureView],
+        shader_path: &Path,
+        bind_group_layouts: &[&BindGroupLayout],
+        bind_groups: &[&BindGroup],
+        options: &PipelineOptions,
+        uniforms: &[&Buffer],
+        pass: &mut RenderPass,
+    ) {
+        // Shadow pulled explicitly from pipeline options
+        let shadow = options.shadow.as_ref().map(|s| (&s.sampler, &s.view));
+        let has_shadow = shadow.is_some();
+
+        // Ensure material layout exists and clone handle
+        let _ = self.materials.layout(texture_views, has_shadow);
+        let material_layout_handle = self
+            .materials
+            .layouts
+            .get(&LayoutKey::from_views(texture_views, has_shadow))
+            .expect("material layout must exist")
+            .clone();
+
+        // Uniform layout
+        let uniform_count = uniforms.len();
+        let mut owned_bgls: Vec<BindGroupLayout> =
+            Vec::with_capacity(if uniform_count > 0 { 2 } else { 1 } + bind_group_layouts.len());
+
+        owned_bgls.push(material_layout_handle);
+
+        if uniform_count > 0 {
+            let _ = self.pipeline_cache.uniform_layout(uniform_count);
+            let uniform_layout_handle = self
+                .pipeline_cache
+                .uniform_layouts
+                .get(&uniform_count)
+                .expect("uniform layout must exist")
+                .clone();
+            owned_bgls.push(uniform_layout_handle);
+        }
+
+        // Combine auto-managed layouts with manual layouts
+        let mut all_layout_refs: Vec<Option<&BindGroupLayout>> =
+            owned_bgls.iter().map(|bgl| Some(bgl)).collect();
+        for bgl in bind_group_layouts.iter() {
+            all_layout_refs.push(Some(*bgl));
+        }
+
+        // Pipeline
+        let pipeline = self
+            .pipeline_cache
+            .get_or_create(shader_path, &all_layout_refs, options, &self.defines)
+            .clone();
+        pass.set_pipeline(&pipeline);
+
+        // Material bind group at group 0
+        let material_bg = self.materials.get_or_create(texture_views, shadow);
+        pass.set_bind_group(0, material_bg, &[]);
+
+        // Uniform bind group at group 1
+        if uniform_count > 0 {
+            let uniform_bg = self.get_or_create_uniform_bind_group(uniforms);
+            pass.set_bind_group(1, uniform_bg, &[]);
+        }
+
+        // Manual bind groups starting at group 2
+        for (i, bg) in bind_groups.iter().enumerate() {
+            pass.set_bind_group(i as u32 + 2, *bg, &[]);
+        }
+    }
     /// Render using fully custom bind group layouts and bind groups with holes.
     ///
     /// Same as [`render_with_layouts()`](crate::renderer::RenderManager::render_with_layouts), but allows holes in the bind group layouts since wgpu 29.0.0 allows this.
