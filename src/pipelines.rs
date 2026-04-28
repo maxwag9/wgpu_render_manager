@@ -71,7 +71,7 @@ pub enum FragmentOption {
 /// Any mismatch between shader expectations and these bindings may
 /// result in wgpu validation errors.
 #[derive(Clone, Debug)]
-pub struct PipelineOptions {
+pub struct PipelineOptions<'a> {
     /// Primitive topology used for rasterization.
     pub topology: PrimitiveTopology,
 
@@ -94,9 +94,12 @@ pub struct PipelineOptions {
 
     /// Optional shadow sampling configuration.
     pub shadow: Option<ShadowOptions>,
+    
+    /// Options for the sampler bound at 0, 0. Default::default will give a trilinear repeating sampler!
+    pub sampler: SamplerDescriptor<'a>
 }
 
-impl Default for PipelineOptions {
+impl Default for PipelineOptions<'_> {
     /// Creates a default pipeline configuration.
     ///
     /// Defaults are chosen to represent a minimal color-rendering pipeline:
@@ -116,12 +119,22 @@ impl Default for PipelineOptions {
             cull_mode: None,
             fragment: FragmentOption::Default {targets: vec![]},
             shadow: None,
+            sampler: SamplerDescriptor {
+                label: Some("material sampler"),
+                address_mode_u: AddressMode::Repeat,
+                address_mode_v: AddressMode::Repeat,
+                address_mode_w: AddressMode::Repeat,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                mipmap_filter: MipmapFilterMode::Linear,
+                ..Default::default()
+            },
         }
     }
 }
 
 
-impl PipelineOptions {
+impl PipelineOptions<'_> {
     /// Sets the primitive topology used by the pipeline.
     pub fn with_topology(mut self, topology: PrimitiveTopology) -> Self {
         self.topology = topology;

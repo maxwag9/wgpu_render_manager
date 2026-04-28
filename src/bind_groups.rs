@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use wgpu::{AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Device, FilterMode, MipmapFilterMode, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages, TextureAspect, TextureSampleType, TextureView, TextureViewDimension};
+use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Device, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages, TextureAspect, TextureSampleType, TextureView, TextureViewDimension};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct MaterialBindGroupKey {
@@ -39,29 +39,20 @@ impl LayoutKey {
 /// Manages material bind groups containing textures and samplers.
 pub(crate) struct MaterialBindGroups {
     device: Device,
-    sampler: Sampler,
     pub(crate) layouts: HashMap<LayoutKey, BindGroupLayout>,
     bind_groups: HashMap<MaterialBindGroupKey, BindGroup>,
+    samplers: HashMap<u64, Sampler>
 }
 
 impl MaterialBindGroups {
     pub(crate) fn new(device: Device) -> Self {
-        let sampler = device.create_sampler(&SamplerDescriptor {
-            label: Some("material sampler"),
-            address_mode_u: AddressMode::Repeat,
-            address_mode_v: AddressMode::Repeat,
-            address_mode_w: AddressMode::Repeat,
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
-            mipmap_filter: MipmapFilterMode::Linear,
-            ..Default::default()
-        });
+        let samplers = HashMap::new();
 
         Self {
             device,
-            sampler,
             layouts: HashMap::new(),
             bind_groups: HashMap::new(),
+            samplers
         }
     }
 
@@ -166,6 +157,7 @@ impl MaterialBindGroups {
         &mut self,
         texture_views: &[&TextureView],
         shadow: Option<(&Sampler, &TextureView)>,
+        sampler: &SamplerDescriptor,
     ) -> &BindGroup {
         let has_shadow = shadow.is_some();
 
@@ -179,9 +171,10 @@ impl MaterialBindGroups {
             let mut binding: u32 = 0;
 
             // binding 0: material sampler
+            let sampler = self.get_or_create_sampler(sampler).clone();
             entries.push(BindGroupEntry {
                 binding,
-                resource: BindingResource::Sampler(&self.sampler),
+                resource: BindingResource::Sampler(&sampler),
             });
             binding += 1;
 
@@ -226,4 +219,34 @@ impl MaterialBindGroups {
     pub fn clear(&mut self) {
         self.bind_groups.clear();
     }
+
+    fn get_or_create_sampler(&mut self, sampler_descriptor: &SamplerDescriptor) -> &Sampler {
+        let key = hash_sampler(sampler_descriptor);
+
+        if !self.samplers.contains_key(&key) {
+            let sampler = self.device.create_sampler(sampler_descriptor);
+            
+            self.samplers.insert(key.clone(), sampler);
+        }
+        self.samplers.get(&key).unwrap()
+    }
+}
+
+fn hash_sampler(sampler_descriptor: &SamplerDescriptor) -> u64 {
+    let sd = sampler_descriptor;
+    let hasher = &mut DefaultHasher::new();
+    sd.label.hash(hasher);
+    sd.address_mode_u.hash(hasher);
+    sd.address_mode_v.hash(hasher);
+    sd.address_mode_w.hash(hasher);
+    sd.anisotropy_clamp.hash(hasher);
+    sd.border_color.hash(hasher);
+    sd.compare.hash(hasher);
+    sd.lod_max_clamp.to_bits().hash(hasher);
+    sd.lod_min_clamp.to_bits().hash(hasher);
+    sd.mag_filter.hash(hasher);
+    sd.min_filter.hash(hasher);
+    sd.mipmap_filter.hash(hasher);
+
+    hasher.finish()
 }

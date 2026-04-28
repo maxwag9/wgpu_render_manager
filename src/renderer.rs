@@ -278,7 +278,7 @@ impl RenderManager {
         pass.set_pipeline(&pipeline);
 
         // Material bind group
-        let material_bg = self.materials.get_or_create(texture_views, shadow);
+        let material_bg = self.materials.get_or_create(texture_views, shadow, &options.sampler);
         pass.set_bind_group(0, material_bg, &[]);
 
         // Uniform bind group
@@ -412,7 +412,7 @@ impl RenderManager {
         pass.set_pipeline(&pipeline);
 
         // Material bind group at group 0
-        let material_bg = self.materials.get_or_create(texture_views, shadow);
+        let material_bg = self.materials.get_or_create(texture_views, shadow, &options.sampler);
         pass.set_bind_group(0, material_bg, &[]);
 
         // Uniform bind group at group 1
