@@ -59,8 +59,8 @@ pub enum FragmentOption {
 ///
 /// ### Group 0: Material + textures
 /// - `@binding(0)`: trilinear sampler
-/// - `@binding(1..n)`: material textures as
-///   `texture_2d<f32>` or `texture_multisampled_2d<f32>`
+/// - `@binding(1)`: textures as texture_2d_array, used with [`ensure_textures()`](Self::ensure_textures)
+/// - `@binding(2..n)`: textures as texture_2d<f32> or texture_multisampled_2d<f32>
 /// - `@binding(n + 1)`: (optional) shadow comparison sampler
 /// - `@binding(n + 2)`: (optional) shadow map as
 ///   `texture_depth_2d_array`

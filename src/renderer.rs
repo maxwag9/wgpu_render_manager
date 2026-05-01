@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use crate::bind_groups::{LayoutKey, MaterialBindGroups};
 use crate::compute_system::{BufferSet, ComputePipelineOptions, ComputeSystem};
 use crate::fullscreen::{DebugVisualization, DepthDebugParams, FullscreenRenderer};
@@ -729,8 +730,16 @@ impl RenderManager {
     fn add_to_texture_array(&mut self, key: &TextureKey) -> u32 {
         let current_size = self.texture_array.current_size;
         let index = current_size;
-
-        let source_texture = self.generator.get_texture(key);
+        let mut key = if key.resolution == 512 {
+            Cow::Borrowed(key)
+        } else {
+            Cow::Owned({
+                let mut k = key.clone();
+                k.resolution = 512;
+                k
+            })
+        };
+        let source_texture = self.generator.get_or_create(&key).texture();
 
         // Resize if needed
         if current_size == self.texture_array.texture.depth_or_array_layers() {
@@ -831,7 +840,7 @@ impl RenderManager {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         self.texture_array.current_size = index + 1;
-        self.texture_array_map.insert(key.clone(), index);
+        self.texture_array_map.insert(key.into_owned(), index);
 
         index
     }

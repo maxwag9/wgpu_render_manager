@@ -269,7 +269,8 @@ impl Hash for TextureParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextureKey {
     pub shader_id: String,
-    pub params: TextureParams
+    pub params: TextureParams,
+    pub resolution: u32
 }
 impl Default for TextureKey {
     fn default() -> Self {
@@ -277,22 +278,24 @@ impl Default for TextureKey {
     }
 }
 impl TextureKey {
-    pub fn new(shader_id: impl Into<String>, params: TextureParams) -> Self {
+    pub fn new(shader_id: impl Into<String>, params: TextureParams, resolution: u32) -> Self {
         Self {
             shader_id: shader_id.into(),
-            params
+            params,
+            resolution
         }
     }
     pub fn notex() -> Self {
         Self {
             shader_id: "notex".to_string(),
-            params: TextureParams::default()
+            params: TextureParams::default(),
+            resolution: 128
         }
     }
 }
 
 struct CachedTexture {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: TextureView,
 }
 
@@ -447,22 +450,12 @@ impl TextureGenerator {
             bind_group_layout,
         });
     }
-    /// Get the underlying texture for a given key.
-    pub fn get_texture(&mut self, key: &TextureKey) -> &wgpu::Texture {
-        if !self.cache.contains_key(key) {
-            self.ensure_pipeline(&key.shader_id);
-            self.generate(key);
-        }
-        &self.cache.get(key).expect("texture must exist after generation")._texture
-    }
     fn generate(&mut self, key: &TextureKey) {
         let pipeline_entry = self.pipelines.get(&key.shader_id).unwrap();
 
         let size = wgpu::Extent3d {
-            width: 512,
-            height: 512,
-            // width: key.resolution,
-            // height: key.resolution,
+            width: key.resolution,
+            height: key.resolution,
             depth_or_array_layers: 1,
         };
         let mip_count = size.max_mips(wgpu::TextureDimension::D2);
@@ -493,10 +486,8 @@ impl TextureGenerator {
             let workgroup_size = 8u32;
 
             for mip in 0..mip_count {
-                let mip_w: u32 = (512 >> mip).max(1);
-                let mip_h: u32 = (512 >> mip).max(1);
-                // let mip_w = (key.resolution >> mip).max(1);
-                // let mip_h = (key.resolution >> mip).max(1);
+                let mip_w = (key.resolution >> mip).max(1);
+                let mip_h = (key.resolution >> mip).max(1);
 
                 let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
                     base_mip_level: mip,
@@ -538,7 +529,7 @@ impl TextureGenerator {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.cache.insert(key.clone(), CachedTexture {
-            _texture: texture,
+            texture: texture,
             view,
         });
     }
