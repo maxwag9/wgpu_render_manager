@@ -5,22 +5,28 @@ use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, Bind
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct MaterialBindGroupKey {
     views_hash: u64,
-    has_shadow: bool
+    has_shadow: bool,
+    texture_array_hash: u64,
 }
 
 impl MaterialBindGroupKey {
-    fn from_views(views: &[&TextureView], has_shadow: bool) -> Self {
+    fn from_views(views: &[&TextureView], has_shadow: bool, texture_array_view: &TextureView) -> Self {
         let mut hasher = DefaultHasher::new();
         for v in views {
             v.hash(&mut hasher);
         }
-        Self { views_hash: hasher.finish(), has_shadow }
+        let texture_array_hash = {
+            let mut h = DefaultHasher::new();
+            texture_array_view.hash(&mut h);
+            h.finish()
+        };
+        Self { views_hash: hasher.finish(), has_shadow, texture_array_hash }
     }
 }
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub(crate) struct LayoutKey {
     layout_hash: u64,
-    has_shadow: bool,
+    has_shadow: bool
 }
 
 impl LayoutKey {
@@ -60,9 +66,8 @@ impl MaterialBindGroups {
     pub(crate) fn layout(
         &mut self,
         texture_views: &[&TextureView],
-        has_shadow: bool,
+        has_shadow: bool
     ) -> &BindGroupLayout {
-
         let key = LayoutKey::from_views(texture_views, has_shadow);
 
         if !self.layouts.contains_key(&key) {
@@ -78,8 +83,22 @@ impl MaterialBindGroups {
             });
             binding += 1;
 
+            // 1: texture array
+            entries.push(BindGroupLayoutEntry {
+                binding,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: TextureViewDimension::D2Array,
+                    sample_type: TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            });
+            binding += 1;
+
+
             let device_features = self.device.features();
-            // 1..N: textures (auto-detect)
+            // 2..N: individual textures
             for view in texture_views {
                 let tex = view.texture();
                 let format = tex.format();
@@ -87,18 +106,15 @@ impl MaterialBindGroups {
 
                 let sample_type = format
                     .sample_type(Some(TextureAspect::All), Some(device_features))
-                    // Fallback for combined depth-stencil: default to depth
                     .or_else(|| format.sample_type(Some(TextureAspect::DepthOnly), Some(device_features)))
                     .expect("Unsupported texture format");
 
-                // Multisampled textures cannot use filtering
                 let sample_type = if is_multisampled {
                     match sample_type {
                         TextureSampleType::Float { .. } => TextureSampleType::Float { filterable: false },
                         other => other,
                     }
                 } else {
-                    // println!("{:?}, {:?}, {:?}", sample_type, is_multisampled, view.texture().format());
                     sample_type
                 };
 
@@ -119,6 +135,7 @@ impl MaterialBindGroups {
 
                 binding += 1;
             }
+
             // Shadow (optional)
             if has_shadow {
                 entries.push(BindGroupLayoutEntry {
@@ -158,13 +175,13 @@ impl MaterialBindGroups {
         texture_views: &[&TextureView],
         shadow: Option<(&Sampler, &TextureView)>,
         sampler: &SamplerDescriptor,
+        texture_array_view: &TextureView,
     ) -> &BindGroup {
         let has_shadow = shadow.is_some();
 
-        let key = MaterialBindGroupKey::from_views(texture_views, has_shadow);
+        let key = MaterialBindGroupKey::from_views(texture_views, has_shadow, texture_array_view);
 
         if !self.bind_groups.contains_key(&key) {
-            // Ensure layout exists
             let layout = &self.layout(texture_views, has_shadow).clone();
 
             let mut entries: Vec<BindGroupEntry> = Vec::new();
@@ -178,7 +195,15 @@ impl MaterialBindGroups {
             });
             binding += 1;
 
-            // binding 1..N: textures
+            // binding 1: texture array (if present)
+            entries.push(BindGroupEntry {
+                binding,
+                resource: BindingResource::TextureView(texture_array_view),
+            });
+            binding += 1;
+
+
+            // binding 2..N: individual textures
             for view in texture_views {
                 entries.push(BindGroupEntry {
                     binding,
@@ -189,14 +214,12 @@ impl MaterialBindGroups {
 
             // optional shadow
             if let Some((shadow_sampler, shadow_view)) = shadow {
-                // comparison sampler
                 entries.push(BindGroupEntry {
                     binding,
                     resource: BindingResource::Sampler(shadow_sampler),
                 });
                 binding += 1;
 
-                // depth texture array
                 entries.push(BindGroupEntry {
                     binding,
                     resource: BindingResource::TextureView(shadow_view),
