@@ -37,7 +37,7 @@ impl TextureArrayData {
         }.max_mips(wgpu::TextureDimension::D2);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("procedural texture array"),
+            label: Some("Procedural Texture Array"),
             size: wgpu::Extent3d {
                 width: TEXTURE_RES,
                 height: TEXTURE_RES,
@@ -47,12 +47,12 @@ impl TextureArrayData {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("procedural texture array view"),
+            label: Some("Procedural Texture Array View"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
@@ -730,7 +730,7 @@ impl RenderManager {
     fn add_to_texture_array(&mut self, key: &TextureKey) -> u32 {
         let current_size = self.texture_array.current_size;
         let index = current_size;
-        let mut key = if key.resolution == 512 {
+        let key = if key.resolution == 512 {
             Cow::Borrowed(key)
         } else {
             Cow::Owned({
