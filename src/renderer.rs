@@ -716,10 +716,19 @@ impl RenderManager {
         let mut indices = Vec::with_capacity(keys.len());
 
         for key in keys {
-            if let Some(&index) = self.texture_array_map.get(key) {
+            let key = if key.resolution == 512 {
+                Cow::Borrowed(key)
+            } else {
+                Cow::Owned({
+                    let mut k = key.clone();
+                    k.resolution = 512;
+                    k
+                })
+            };
+            if let Some(&index) = self.texture_array_map.get(&key) {
                 indices.push(index);
             } else {
-                let index = self.add_to_texture_array(key);
+                let index = self.add_to_texture_array(&key);
                 indices.push(index);
             }
         }
@@ -730,15 +739,7 @@ impl RenderManager {
     fn add_to_texture_array(&mut self, key: &TextureKey) -> u32 {
         let current_size = self.texture_array.current_size;
         let index = current_size;
-        let key = if key.resolution == 512 {
-            Cow::Borrowed(key)
-        } else {
-            Cow::Owned({
-                let mut k = key.clone();
-                k.resolution = 512;
-                k
-            })
-        };
+
         let source_texture = self.generator.get_or_create(&key).texture();
 
         // Resize if needed
@@ -840,7 +841,7 @@ impl RenderManager {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         self.texture_array.current_size = index + 1;
-        self.texture_array_map.insert(key.into_owned(), index);
+        self.texture_array_map.insert(key.clone(), index);
 
         index
     }
