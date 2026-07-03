@@ -84,7 +84,7 @@ pub struct PipelineOptions<'a> {
     pub depth_stencil: Option<DepthStencilState>,
 
     /// Vertex buffer layouts consumed by the vertex shader.
-    pub vertex_layouts: Vec<VertexBufferLayout<'static>>,
+    pub vertex_layouts: Vec<Option<VertexBufferLayout<'static>>>,
 
     /// Optional face culling mode.
     pub cull_mode: Option<Face>,
@@ -158,7 +158,7 @@ impl PipelineOptions<'_> {
     /// Adds a vertex buffer layout consumed by the vertex shader.
     ///
     /// Layouts are consumed in the order they are added.
-    pub fn with_vertex_layout(mut self, layout: VertexBufferLayout<'static>) -> Self {
+    pub fn with_vertex_layout(mut self, layout: Option<VertexBufferLayout<'static>>) -> Self {
         self.vertex_layouts.push(layout);
         self
     }
@@ -487,7 +487,7 @@ fn hash_blend_state(hasher: &mut impl Hasher, blend: &Option<BlendState>) {
     }
 }
 
-fn hash_layouts(bgls: &[Option<&BindGroupLayout>], vertex_layouts: &[VertexBufferLayout]) -> u64 {
+fn hash_layouts(bgls: &[Option<&BindGroupLayout>], vertex_layouts: &[Option<VertexBufferLayout>]) -> u64 {
     let mut hasher = DefaultHasher::new();
 
     for &bgl in bgls {
