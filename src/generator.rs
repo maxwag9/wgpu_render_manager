@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 use wgpu::{Device, Queue, TextureView};
@@ -153,6 +154,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Padding fields are included to satisfy GPU alignment requirements.
 #[repr(C)]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[revisioned(revision = 1)]
 pub struct TextureParams {
     pub color_primary: [f32; 4],
     pub color_secondary: [f32; 4],
@@ -267,6 +269,7 @@ impl Hash for TextureParams {
 ///
 /// Identical keys will always reuse the same cached texture.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[revisioned(revision = 1)]
 pub struct TextureKey {
     pub shader_id: String,
     pub params: TextureParams,
