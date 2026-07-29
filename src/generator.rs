@@ -30,10 +30,12 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::time::Duration;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 use wgpu::{Device, Queue, TextureView};
+use wgpu::wgt::PollType::Wait;
 
 pub const NOTEX_SHADER: &str = r#"
 // notex.wgsl - "No Texture" placeholder texture
@@ -137,6 +139,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(output, vec2<i32>(gid.xy), vec4(color, 1.0));
 }
 "#;
+
+const DOWNSAMPLE_PIPELINE_KEY: &str = "__downsample__";
+const COVERAGE_PIPELINE_KEY: &str = "__coverage__";
+const ALPHA_TEST_THRESHOLD: f32 = 0.5;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DownsampleParams {
+    alpha_scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CoverageParams {
+    threshold: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
+const DOWNSAMPLE_SHADER: &str = include_str!("shaders/downsample.wgsl");
+const COVERAGE_SHADER: &str = include_str!("shaders/coverage.wgsl");
 
 /// Parameters passed to procedural texture generation shaders.
 ///
@@ -259,6 +286,23 @@ impl Hash for TextureParams {
         }
     }
 }
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[revisioned(revision = 1)]
+pub enum MipmapMode {
+    /// No mipmapping, single mip texture.
+    None,
+    #[default]
+    /// Every mip level is procedurally generated at the mips' resolution
+    Generate,
+    /// Texture is procedurally generated once at mip 0, then each subsequent mip is a straight box-filter downsample (alpha-weighted color, plain-averaged alpha) of the mip above it.
+    GenerateDownsample,
+    /// Same as GenerateDownsample, but after each mip is produced its alpha coverage (fraction of texels above ALPHA_TEST_THRESHOLD (0.5)) is measured via a GPU atomic counter and compared against mip 0's coverage.
+    ///
+    /// The alpha channel is then rescaled (never reduced) and the mip regenerated, iterating up to 3 times to converge coverage toward the base mips' ratio, this is what keeps leaf silhouettes from thinning out at distance.
+    ///
+    /// Useful for leaves of trees.
+    AlphaPreserving
+}
 
 /// Key used for procedural texture caching.
 ///
@@ -269,11 +313,13 @@ impl Hash for TextureParams {
 ///
 /// Identical keys will always reuse the same cached texture.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 pub struct TextureKey {
     pub shader_id: String,
     pub params: TextureParams,
-    pub resolution: u32
+    pub resolution: u32,
+    #[revision(start = 2)]
+    pub mipmap_mode: MipmapMode
 }
 impl Default for TextureKey {
     fn default() -> Self {
@@ -281,18 +327,20 @@ impl Default for TextureKey {
     }
 }
 impl TextureKey {
-    pub fn new(shader_id: impl Into<String>, params: TextureParams, resolution: u32) -> Self {
+    pub fn new(shader_id: impl Into<String>, params: TextureParams, resolution: u32, mipmap_mode: MipmapMode) -> Self {
         Self {
             shader_id: shader_id.into(),
             params,
-            resolution
+            resolution,
+            mipmap_mode
         }
     }
     pub fn notex() -> Self {
         Self {
             shader_id: "notex".to_string(),
             params: TextureParams::default(),
-            resolution: 128
+            resolution: 128,
+            mipmap_mode: MipmapMode::Generate
         }
     }
 }
@@ -454,14 +502,18 @@ impl TextureGenerator {
         });
     }
     fn generate(&mut self, key: &TextureKey) {
-        let pipeline_entry = self.pipelines.get(&key.shader_id).unwrap();
-
         let size = wgpu::Extent3d {
             width: key.resolution,
             height: key.resolution,
             depth_or_array_layers: 1,
         };
-        let mip_count = size.max_mips(wgpu::TextureDimension::D2);
+
+        let mip_count = match key.mipmap_mode {
+            MipmapMode::None => 1,
+            MipmapMode::Generate | MipmapMode::GenerateDownsample | MipmapMode::AlphaPreserving => {
+                size.max_mips(wgpu::TextureDimension::D2)
+            }
+        };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("procedural texture {}", key.shader_id)),
@@ -474,66 +526,427 @@ impl TextureGenerator {
             view_formats: &[],
         });
 
+        match key.mipmap_mode {
+            MipmapMode::None => {
+                self.generate_base_mip(key, &texture, 0, key.resolution, key.resolution);
+            }
+
+            MipmapMode::Generate => {
+                for mip in 0..mip_count {
+                    let mip_w = (key.resolution >> mip).max(1);
+                    let mip_h = (key.resolution >> mip).max(1);
+                    self.generate_base_mip(key, &texture, mip, mip_w, mip_h);
+                }
+            }
+
+            MipmapMode::GenerateDownsample => {
+                self.generate_base_mip(key, &texture, 0, key.resolution, key.resolution);
+                self.ensure_downsample_pipeline();
+
+                for mip in 1..mip_count {
+                    let src_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        base_mip_level: mip - 1,
+                        mip_level_count: Some(1),
+                        ..Default::default()
+                    });
+                    let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        base_mip_level: mip,
+                        mip_level_count: Some(1),
+                        ..Default::default()
+                    });
+                    let dst_w = (key.resolution >> mip).max(1);
+                    let dst_h = (key.resolution >> mip).max(1);
+
+                    self.downsample_pass(&src_view, &dst_view, dst_w, dst_h, 1.0);
+                }
+            }
+
+            MipmapMode::AlphaPreserving => {
+                self.generate_base_mip(key, &texture, 0, key.resolution, key.resolution);
+                self.ensure_downsample_pipeline();
+                self.ensure_coverage_pipeline();
+
+                let base_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: 0,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                });
+                let base_coverage = self.coverage_ratio(&base_view, key.resolution, key.resolution);
+
+                for mip in 1..mip_count {
+                    let src_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        base_mip_level: mip - 1,
+                        mip_level_count: Some(1),
+                        ..Default::default()
+                    });
+                    let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        base_mip_level: mip,
+                        mip_level_count: Some(1),
+                        ..Default::default()
+                    });
+                    let dst_w = (key.resolution >> mip).max(1);
+                    let dst_h = (key.resolution >> mip).max(1);
+
+                    let mut scale = 1.0f32;
+                    for _ in 0..3 {
+                        self.downsample_pass(&src_view, &dst_view, dst_w, dst_h, scale);
+                        let mip_coverage = self.coverage_ratio(&dst_view, dst_w, dst_h);
+                        if mip_coverage < 0.0001 {
+                            break;
+                        }
+                        let ratio = (base_coverage / mip_coverage).clamp(0.5, 4.0);
+                        if (ratio - 1.0).abs() < 0.01 {
+                            break;
+                        }
+                        scale = (scale * ratio).clamp(1.0, 32.0);
+                    }
+                }
+            }
+        }
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.cache.insert(key.clone(), CachedTexture {
+            texture,
+            view,
+        });
+    }
+    fn generate_base_mip(&mut self, key: &TextureKey, texture: &wgpu::Texture, mip: u32, mip_w: u32, mip_h: u32) {
+        let pipeline_entry = self.pipelines.get(&key.shader_id).unwrap();
+
+        let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+
+        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&key.params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline_entry.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&dst_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("procedural texture generation"),
         });
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("generate texture mips"),
+                label: Some("generate texture mip"),
                 timestamp_writes: None,
             });
 
             compute_pass.set_pipeline(&pipeline_entry.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
 
             let workgroup_size = 8u32;
-
-            for mip in 0..mip_count {
-                let mip_w = (key.resolution >> mip).max(1);
-                let mip_h = (key.resolution >> mip).max(1);
-
-                let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
-                    base_mip_level: mip,
-                    mip_level_count: Some(1),
-                    ..Default::default()
-                });
-
-                let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::bytes_of(&key.params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-
-                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &pipeline_entry.bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&dst_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: uniform_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-
-                compute_pass.set_bind_group(0, &bind_group, &[]);
-                compute_pass.dispatch_workgroups(
-                    mip_w.div_ceil(workgroup_size),
-                    mip_h.div_ceil(workgroup_size),
-                    1,
-                );
-            }
+            compute_pass.dispatch_workgroups(
+                mip_w.div_ceil(workgroup_size),
+                mip_h.div_ceil(workgroup_size),
+                1,
+            );
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.cache.insert(key.clone(), CachedTexture {
-            texture: texture,
-            view,
+    fn ensure_downsample_pipeline(&mut self) {
+        if self.pipelines.contains_key(DOWNSAMPLE_PIPELINE_KEY) {
+            return;
+        }
+
+        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("downsample"),
+            source: wgpu::ShaderSource::Wgsl(DOWNSAMPLE_SHADER.into()),
+        });
+
+        let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("downsample bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("downsample pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("downsample compute pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        self.pipelines.insert(DOWNSAMPLE_PIPELINE_KEY.to_string(), ComputePipeline {
+            pipeline,
+            bind_group_layout,
         });
     }
+
+    fn ensure_coverage_pipeline(&mut self) {
+        if self.pipelines.contains_key(COVERAGE_PIPELINE_KEY) {
+            return;
+        }
+
+        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("coverage"),
+            source: wgpu::ShaderSource::Wgsl(COVERAGE_SHADER.into()),
+        });
+
+        let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("coverage bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("coverage pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("coverage compute pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        self.pipelines.insert(COVERAGE_PIPELINE_KEY.to_string(), ComputePipeline {
+            pipeline,
+            bind_group_layout,
+        });
+    }
+
+    fn downsample_pass(&mut self, src_view: &wgpu::TextureView, dst_view: &wgpu::TextureView, dst_w: u32, dst_h: u32, alpha_scale: f32) {
+        let pipeline_entry = self.pipelines.get(DOWNSAMPLE_PIPELINE_KEY).unwrap();
+
+        let params = DownsampleParams {
+            alpha_scale,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+
+        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline_entry.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(dst_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("downsample mip"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("downsample pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&pipeline_entry.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+
+            let workgroup_size = 8u32;
+            compute_pass.dispatch_workgroups(
+                dst_w.div_ceil(workgroup_size),
+                dst_h.div_ceil(workgroup_size),
+                1,
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn coverage_ratio(&mut self, src_view: &wgpu::TextureView, width: u32, height: u32) -> f32 {
+        let pipeline_entry = self.pipelines.get(COVERAGE_PIPELINE_KEY).unwrap();
+
+        let counter_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("coverage counter"),
+            contents: bytemuck::bytes_of(&0u32),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let params = CoverageParams {
+            threshold: ALPHA_TEST_THRESHOLD,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+
+        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline_entry.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: counter_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("coverage readback"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("coverage count"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("coverage pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&pipeline_entry.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+
+            let workgroup_size = 8u32;
+            compute_pass.dispatch_workgroups(
+                width.div_ceil(workgroup_size),
+                height.div_ceil(workgroup_size),
+                1,
+            );
+        }
+
+        encoder.copy_buffer_to_buffer(&counter_buffer, 0, &readback_buffer, 0, 4);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let count = self.read_u32_buffer(&readback_buffer);
+        count as f32 / (width * height) as f32
+    }
+
+    fn read_u32_buffer(&self, buffer: &wgpu::Buffer) -> u32 {
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(Wait { submission_index: None, timeout: Some(Duration::from_secs(5)) }).expect("Reading buffer timed out");
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range().unwrap();
+        let value = u32::from_ne_bytes(data[0..4].try_into().unwrap());
+        drop(data);
+        buffer.unmap();
+        value
+    }
 }
+
+

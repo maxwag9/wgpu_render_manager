@@ -75,10 +75,11 @@ pub struct PipelineOptions<'a> {
     /// Primitive topology used for rasterization.
     pub topology: PrimitiveTopology,
 
+    /// Multisample state with alpha to coverage option
     /// Number of MSAA samples used by the pipeline.
     ///
     /// This **must** match the sample count of the render target.
-    pub msaa_samples: u32,
+    pub multisample_state: MultisampleState,
 
     /// Optional depth-stencil configuration.
     pub depth_stencil: Option<DepthStencilState>,
@@ -113,7 +114,7 @@ impl Default for PipelineOptions<'_> {
     fn default() -> Self {
         Self {
             topology: PrimitiveTopology::TriangleList,
-            msaa_samples: 1,
+            multisample_state: MultisampleState::default(),
             depth_stencil: None,
             vertex_layouts: vec![],
             cull_mode: None,
@@ -144,8 +145,8 @@ impl PipelineOptions<'_> {
     /// Sets the MSAA sample count for the pipeline.
     ///
     /// This must match the sample count of the render target view.
-    pub fn with_msaa(mut self, samples: u32) -> Self {
-        self.msaa_samples = samples;
+    pub fn with_multisample_state(mut self, multisample_state: MultisampleState) -> Self {
+        self.multisample_state = multisample_state;
         self
     }
 
@@ -220,7 +221,7 @@ struct PipelineKey {
     shader_path: PathBuf,
     layout_hash: u64,
     topology: PrimitiveTopology,
-    msaa_samples: u32,
+    multisample_state: MultisampleState,
     depth_stencil: Option<DepthStencilKey>,
     cull_mode: Option<Face>,
     fragment_hash: u64,
@@ -315,7 +316,7 @@ impl PipelineCache {
             shader_path: shader_path.to_path_buf(),
             layout_hash,
             topology: options.topology,
-            msaa_samples: options.msaa_samples,
+            multisample_state: options.multisample_state,
             depth_stencil: options.depth_stencil.as_ref().map(|d| d.into()),
             cull_mode: options.cull_mode,
             fragment_hash: hash_fragment(&options.fragment),
@@ -417,13 +418,9 @@ impl PipelineCache {
                 conservative: false,
             },
             depth_stencil: options.depth_stencil.clone(),
-            multisample: MultisampleState {
-                count: options.msaa_samples,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
+            multisample: options.multisample_state,
             cache: None,
-            multiview_mask: None,
+            multiview_mask: None
         })
     }
 }
@@ -498,7 +495,7 @@ fn hash_layouts(bgls: &[Option<&BindGroupLayout>], vertex_layouts: &[Option<Vert
     }
     hasher.finish()
 }
-pub fn hash_defines(defines: &HashMap<String, bool>) -> u64 { // stable: hashes the values as well, or else shaders wouldn't be updated on change!
+pub(crate) fn hash_defines(defines: &HashMap<String, bool>) -> u64 { // stable: hashes the values as well, or else shaders wouldn't be updated on change!
     // Use a small stack vec for sorting keys
     let mut keys: Vec<_> = defines.keys().collect();
     keys.sort_unstable(); // faster than stable sort

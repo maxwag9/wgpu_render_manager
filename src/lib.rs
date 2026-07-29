@@ -44,3 +44,4 @@ pub mod fullscreen;
 pub mod renderer;
 mod bind_groups;
 mod shader_preprocessing;
+pub mod mipmapping;
