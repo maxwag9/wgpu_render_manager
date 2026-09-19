@@ -101,7 +101,7 @@ pub struct RenderManager {
     uniform_bind_groups: HashMap<UniformBindGroupKey, BindGroup>,
     defines: HashMap<String, bool>,
     texture_array: TextureArrayData,
-    texture_array_map: HashMap<TextureKey, u32>,
+    texture_array_map: HashMap<TextureKey, u32>
 }
 
 impl RenderManager {
@@ -131,7 +131,7 @@ impl RenderManager {
             uniform_bind_groups: HashMap::new(),
             defines: HashMap::new(),
             texture_array: TextureArrayData::empty(device, 32),
-            texture_array_map: HashMap::new(),
+            texture_array_map: HashMap::new()
         }
     }
 
@@ -224,10 +224,10 @@ impl RenderManager {
     pub fn render(
         &mut self,
         texture_keys: &[TextureKey],
-        shader_path: &Path,
+        shader_path: impl AsRef<Path>,
         options: &PipelineOptions,
         uniforms: &[&Buffer],
-        pass: &mut RenderPass,
+        pass: &mut RenderPass
     ) {
         // Cloning TextureView is cheap — it's just a handle to the underlying GPU object.
         let mut owned_views: Vec<TextureView> = Vec::with_capacity(texture_keys.len());
@@ -279,10 +279,10 @@ impl RenderManager {
     pub fn render_with_textures(
         &mut self,
         texture_views: &[&TextureView],
-        shader_path: &Path,
+        shader_path: impl AsRef<Path>,
         options: &PipelineOptions,
         uniforms: &[&Buffer],
-        pass: &mut RenderPass,
+        pass: &mut RenderPass
     ) {
         // Shadow pulled explicitly from pipeline options
         let shadow = options.shadow.as_ref().map(|s| (&s.sampler, &s.view));
@@ -290,38 +290,26 @@ impl RenderManager {
 
         // Ensure material layout exists and clone handle
         let _ = self.materials.layout(texture_views, has_shadow);
-        let material_layout_handle = self
-            .materials
-            .layouts
-            .get(&LayoutKey::from_views(texture_views, has_shadow))
-            .expect("material layout must exist")
-            .clone();
+        let material_layout_handle = self.materials.layouts.get(&LayoutKey::from_views(texture_views, has_shadow)).expect("material layout must exist").clone();
 
         // Uniform layout
         let uniform_count = uniforms.len();
-        let mut owned_bgls: Vec<BindGroupLayout> =
-            Vec::with_capacity(if uniform_count > 0 { 2 } else { 1 });
+        let mut owned_bgls: Vec<BindGroupLayout> = Vec::with_capacity(if uniform_count > 0 { 2 } else { 1 });
 
         owned_bgls.push(material_layout_handle);
 
         if uniform_count > 0 {
             let _ = self.pipeline_cache.uniform_layout(uniform_count);
-            let uniform_layout_handle = self
-                .pipeline_cache
-                .uniform_layouts
-                .get(&uniform_count)
-                .expect("uniform layout must exist")
-                .clone();
+            let uniform_layout_handle = self.pipeline_cache.uniform_layouts
+                .get(&uniform_count).expect("uniform layout must exist").clone();
             owned_bgls.push(uniform_layout_handle);
         }
 
         // Local references only
         let bind_group_layout_refs: Vec<Option<&BindGroupLayout>> = owned_bgls.iter().map(|bgl| Some(bgl)).collect::<Vec<_>>();
-
+        let shader_path = shader_path.as_ref();
         // Pipeline
-        let pipeline_ref = self
-            .pipeline_cache
-            .get_or_create(shader_path, &bind_group_layout_refs, options, &self.defines);
+        let pipeline_ref = self.pipeline_cache.get_or_create(shader_path, &bind_group_layout_refs, options, &self.defines);
         let pipeline = pipeline_ref.clone();
         pass.set_pipeline(&pipeline);
 
@@ -350,12 +338,13 @@ impl RenderManager {
     /// standard WGSL before passing it to wgpu.
     pub fn render_with_layouts(
         &mut self,
-        shader_path: &Path,
+        shader_path: impl AsRef<Path>,
         bind_group_layouts: &[&BindGroupLayout],
         bind_groups: &[&BindGroup],
         options: &PipelineOptions,
-        pass: &mut RenderPass,
+        pass: &mut RenderPass
     ) {
+        let shader_path = shader_path.as_ref();
         let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts.iter().map(|bgl| Some(*bgl)).collect::<Vec<_>>().as_slice(), options, &self.defines);
         pass.set_pipeline(pipeline);
 
@@ -408,12 +397,12 @@ impl RenderManager {
     pub fn render_with_layouts_and_textures(
         &mut self,
         texture_views: &[&TextureView],
-        shader_path: &Path,
+        shader_path: impl AsRef<Path>,
         bind_group_layouts: &[&BindGroupLayout],
         bind_groups: &[&BindGroup],
         options: &PipelineOptions,
         uniforms: &[&Buffer],
-        pass: &mut RenderPass,
+        pass: &mut RenderPass
     ) {
         // Shadow pulled explicitly from pipeline options
         let shadow = options.shadow.as_ref().map(|s| (&s.sampler, &s.view));
@@ -421,9 +410,7 @@ impl RenderManager {
 
         // Ensure material layout exists and clone handle
         let _ = self.materials.layout(texture_views, has_shadow);
-        let material_layout_handle = self
-            .materials
-            .layouts
+        let material_layout_handle = self.materials.layouts
             .get(&LayoutKey::from_views(texture_views, has_shadow))
             .expect("material layout must exist")
             .clone();
@@ -452,12 +439,9 @@ impl RenderManager {
         for bgl in bind_group_layouts.iter() {
             all_layout_refs.push(Some(*bgl));
         }
-
+        let shader_path = shader_path.as_ref();
         // Pipeline
-        let pipeline = self
-            .pipeline_cache
-            .get_or_create(shader_path, &all_layout_refs, options, &self.defines)
-            .clone();
+        let pipeline = self.pipeline_cache.get_or_create(shader_path, &all_layout_refs, options, &self.defines).clone();
         pass.set_pipeline(&pipeline);
 
         // Material bind group at group 0
@@ -480,12 +464,13 @@ impl RenderManager {
     /// Same as [`render_with_layouts()`](crate::renderer::RenderManager::render_with_layouts), but allows holes in the bind group layouts since wgpu 29.0.0 allows this.
     pub fn render_with_layouts_holed(
         &mut self,
-        shader_path: &Path,
+        shader_path: impl AsRef<Path>,
         bind_group_layouts: &[Option<&BindGroupLayout>],
         bind_groups: &[&BindGroup],
         options: &PipelineOptions,
-        pass: &mut RenderPass,
+        pass: &mut RenderPass
     ) {
+        let shader_path = shader_path.as_ref();
         let pipeline = self.pipeline_cache.get_or_create(shader_path, bind_group_layouts, options, &self.defines);
         pass.set_pipeline(pipeline);
 
@@ -506,7 +491,7 @@ impl RenderManager {
         texture: &TextureView,
         visualization_type: DebugVisualization,
         target_view: &TextureView,
-        pass: &mut RenderPass,
+        pass: &mut RenderPass
     ) {
         self.fullscreen.render(texture, visualization_type, target_view, pass);
     }
