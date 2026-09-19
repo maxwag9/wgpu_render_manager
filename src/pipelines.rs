@@ -20,7 +20,7 @@ use crate::shader_preprocessing::compile_wgsl;
 /// The sampler **must** be a comparison sampler compatible with
 /// depth textures, and the texture view must point to a depth texture
 /// array.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct ShadowOptions {
     /// Comparison sampler used for shadow testing.
     pub sampler: Sampler,
@@ -226,6 +226,7 @@ struct PipelineKey {
     cull_mode: Option<Face>,
     fragment_hash: u64,
     defines_hash: u64,
+    //shadow_hash: u64
 }
 
 struct ShaderEntry {
@@ -320,7 +321,8 @@ impl PipelineCache {
             depth_stencil: options.depth_stencil.as_ref().map(|d| d.into()),
             cull_mode: options.cull_mode,
             fragment_hash: hash_fragment(&options.fragment),
-            defines_hash: hash_defines(defines)
+            defines_hash: hash_defines(defines),
+            //shadow_hash: hash_shadow(&options.shadow)
         };
 
         if !self.pipelines.contains_key(&key) {
@@ -506,5 +508,12 @@ pub(crate) fn hash_defines(defines: &HashMap<String, bool>) -> u64 { // stable: 
         // unwrap is safe because key exists in the map
         defines.get(k).unwrap().hash(&mut hasher);
     }
+    hasher.finish()
+}
+fn hash_shadow(shadow: &Option<ShadowOptions>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+
+    shadow.hash(&mut hasher);
+
     hasher.finish()
 }

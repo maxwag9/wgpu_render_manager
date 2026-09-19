@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
@@ -315,7 +316,7 @@ pub enum MipmapMode {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 #[revisioned(revision = 2)]
 pub struct TextureKey {
-    pub shader_id: String,
+    pub shader_id: PathBuf,
     pub params: TextureParams,
     pub resolution: u32,
     #[revision(start = 2)]
@@ -327,7 +328,7 @@ impl Default for TextureKey {
     }
 }
 impl TextureKey {
-    pub fn new(shader_id: impl Into<String>, params: TextureParams, resolution: u32, mipmap_mode: MipmapMode) -> Self {
+    pub fn new(shader_id: impl Into<PathBuf>, params: TextureParams, resolution: u32, mipmap_mode: MipmapMode) -> Self {
         Self {
             shader_id: shader_id.into(),
             params,
@@ -337,7 +338,7 @@ impl TextureKey {
     }
     pub fn notex() -> Self {
         Self {
-            shader_id: "notex".to_string(),
+            shader_id: PathBuf::from_str("notex").unwrap_or_default(),
             params: TextureParams::default(),
             resolution: 128,
             mipmap_mode: MipmapMode::Generate
@@ -360,10 +361,6 @@ struct ComputePipeline {
 /// Textures are generated using WGSL compute shaders and cached
 /// to avoid redundant computation.
 ///
-/// ## Shader loading
-/// Shaders are automatically loaded from:
-/// `{shader_dir}/{shader_id.to_lowercase()}.wgsl`
-///
 /// ## Caching behavior
 /// - Pipelines are cached per shader ID
 /// - Generated textures are cached per [`TextureKey`]
@@ -375,22 +372,20 @@ struct ComputePipeline {
 pub struct TextureGenerator {
     device: Device,
     queue: Queue,
-    shader_dir: PathBuf,
-    pipelines: HashMap<String, ComputePipeline>,
-    cache: HashMap<TextureKey, CachedTexture>,
+    pipelines: HashMap<PathBuf, ComputePipeline>,
+    cache: HashMap<TextureKey, CachedTexture>
 }
 
 impl TextureGenerator {
     /// Create a new `TextureGenerator`.
     ///
     /// Procedural texture shaders will be loaded from `{shader_dir}/{material_name.to_lowercase()}.wgsl`.
-    pub fn new(device: Device, queue: Queue, shader_dir: PathBuf) -> Self {
+    pub fn new(device: Device, queue: Queue) -> Self {
         Self {
             device,
             queue,
-            shader_dir,
             pipelines: HashMap::new(),
-            cache: HashMap::new(),
+            cache: HashMap::new()
         }
     }
 
@@ -430,33 +425,26 @@ impl TextureGenerator {
         self.cache.contains_key(key)
     }
 
-    /// Get the shader directory.
-    pub fn shader_dir(&self) -> &PathBuf {
-        &self.shader_dir
-    }
-
-    fn ensure_pipeline(&mut self, shader_id: &str) {
-        if self.pipelines.contains_key(shader_id) {
+    fn ensure_pipeline(&mut self, shader_path: &PathBuf) {
+        if self.pipelines.contains_key(shader_path) {
             return;
         }
 
-        let shader_module = if shader_id == "notex" {
+        let shader_module = if shader_path == "notex" {
             self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(shader_id),
-                source: wgpu::ShaderSource::Wgsl(NOTEX_SHADER.into()),
+                label: Some(shader_path.display().to_string().as_str()),
+                source: wgpu::ShaderSource::Wgsl(NOTEX_SHADER.into())
             })
         } else {
-            let shader_path = self.shader_dir.join(format!("{}.wgsl", shader_id.to_lowercase()));
-            let shader_source = std::fs::read_to_string(&shader_path)
-                .unwrap_or_else(|e| panic!("Failed to read shader {:?}: {}", shader_path, e));
+            let shader_source = std::fs::read_to_string(&shader_path).unwrap_or_else(|e| panic!("Failed to read shader {:?}: {}", shader_path, e));
             self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(shader_id),
-                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+                label: Some(shader_path.display().to_string().as_str()),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into())
             })
         };
 
         let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(&format!("{} bind group layout", shader_id)),
+            label: Some(&format!("{} bind group layout", shader_path.display().to_string())),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -482,13 +470,13 @@ impl TextureGenerator {
         });
 
         let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("{} pipeline layout", shader_id)),
+            label: Some(&format!("{} pipeline layout", shader_path.display().to_string())),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
 
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(&format!("{} compute pipeline", shader_id)),
+            label: Some(&format!("{} compute pipeline", shader_path.display().to_string())),
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("main"),
@@ -496,7 +484,7 @@ impl TextureGenerator {
             cache: None,
         });
 
-        self.pipelines.insert(shader_id.to_string(), ComputePipeline {
+        self.pipelines.insert(shader_path.clone(), ComputePipeline {
             pipeline,
             bind_group_layout,
         });
@@ -516,7 +504,7 @@ impl TextureGenerator {
         };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(&format!("procedural texture {}", key.shader_id)),
+            label: Some(&format!("procedural texture {:?}", key.shader_id)),
             size,
             mip_level_count: mip_count,
             sample_count: 1,
@@ -665,7 +653,7 @@ impl TextureGenerator {
     }
 
     fn ensure_downsample_pipeline(&mut self) {
-        if self.pipelines.contains_key(DOWNSAMPLE_PIPELINE_KEY) {
+        if self.pipelines.contains_key(&PathBuf::from_str(DOWNSAMPLE_PIPELINE_KEY).unwrap_or_default()) {
             return;
         }
 
@@ -725,14 +713,14 @@ impl TextureGenerator {
             cache: None,
         });
 
-        self.pipelines.insert(DOWNSAMPLE_PIPELINE_KEY.to_string(), ComputePipeline {
+        self.pipelines.insert(PathBuf::from_str(DOWNSAMPLE_PIPELINE_KEY).unwrap_or_default(), ComputePipeline {
             pipeline,
             bind_group_layout,
         });
     }
 
     fn ensure_coverage_pipeline(&mut self) {
-        if self.pipelines.contains_key(COVERAGE_PIPELINE_KEY) {
+        if self.pipelines.contains_key(&PathBuf::from_str(COVERAGE_PIPELINE_KEY).unwrap_or_default()) {
             return;
         }
 
@@ -792,14 +780,14 @@ impl TextureGenerator {
             cache: None,
         });
 
-        self.pipelines.insert(COVERAGE_PIPELINE_KEY.to_string(), ComputePipeline {
+        self.pipelines.insert(PathBuf::from_str(COVERAGE_PIPELINE_KEY).unwrap_or_default(), ComputePipeline {
             pipeline,
             bind_group_layout,
         });
     }
 
     fn downsample_pass(&mut self, src_view: &wgpu::TextureView, dst_view: &wgpu::TextureView, dst_w: u32, dst_h: u32, alpha_scale: f32) {
-        let pipeline_entry = self.pipelines.get(DOWNSAMPLE_PIPELINE_KEY).unwrap();
+        let pipeline_entry = self.pipelines.get(&PathBuf::from_str(DOWNSAMPLE_PIPELINE_KEY).unwrap_or_default()).unwrap();
 
         let params = DownsampleParams {
             alpha_scale,
@@ -858,7 +846,7 @@ impl TextureGenerator {
     }
 
     fn coverage_ratio(&mut self, src_view: &wgpu::TextureView, width: u32, height: u32) -> f32 {
-        let pipeline_entry = self.pipelines.get(COVERAGE_PIPELINE_KEY).unwrap();
+        let pipeline_entry = self.pipelines.get(&PathBuf::from_str(COVERAGE_PIPELINE_KEY).unwrap_or_default()).unwrap();
 
         let counter_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("coverage counter"),

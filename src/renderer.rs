@@ -114,8 +114,8 @@ impl RenderManager {
     /// The provided `device` and `queue` are cloned internally and reused
     /// by all sub-systems.
     /// Cloning `device` and `queue` is very cheap, as they are just handles in wgpu.
-    pub fn new(device: &Device, queue: &Queue, texture_shader_dir: PathBuf) -> Self {
-        let generator = TextureGenerator::new(device.clone(), queue.clone(), texture_shader_dir);
+    pub fn new(device: &Device, queue: &Queue) -> Self {
+        let generator = TextureGenerator::new(device.clone(), queue.clone());
         let pipeline_cache = PipelineCache::new(device.clone());
         let fullscreen = FullscreenRenderer::new(device.clone(), queue.clone());
         let materials = MaterialBindGroups::new(device.clone());
