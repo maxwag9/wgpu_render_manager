@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu_render_manager"
-version = "30.0.4"
+version = "30.0.5"
 dependencies = [
  "bytemuck",
  "revision",

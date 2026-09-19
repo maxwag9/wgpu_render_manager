@@ -1,10 +1,10 @@
 // compute_system.rs
 #![allow(dead_code)]
-use std::collections::{HashMap};
-use std::path::{PathBuf};
-use wgpu::*;
 use crate::pipelines::hash_defines;
 use crate::shader_preprocessing::compile_wgsl;
+use std::collections::HashMap;
+use std::path::Path;
+use wgpu::*;
 
 /// Options for compute dispatch
 pub struct ComputePipelineOptions {
@@ -131,7 +131,7 @@ impl ComputeSystem {
         label: &str,
         input_views: Vec<&TextureView>,
         output_views: Vec<&TextureView>,
-        shader_path: &PathBuf,
+        shader_path: impl AsRef<Path>,
         options: ComputePipelineOptions,
         buffer_sets: &[BufferSet],
         defines: &HashMap<String, bool>,
@@ -172,7 +172,7 @@ impl ComputeSystem {
             .iter()
             .map(|b| buffer_binding_type(b))
             .collect();
-
+        let shader_path = shader_path.as_ref();
         let key = PipelineKey {
             shader_path: shader_path.to_str().unwrap_or("").to_string(),
             input_specs: input_specs.clone(),
@@ -265,13 +265,13 @@ impl ComputeSystem {
 
     fn create_pipeline(
         &self,
-        shader_path: &PathBuf,
+        shader_path: impl AsRef<Path>,
         input_specs: &[(TextureFormat, u32, bool)], // (format, sample_count, is_filterable)
         output_formats: &[TextureFormat],
         buffer_bindings: &[BufferBindingType],
         defines: &HashMap<String, bool>,
     ) -> CachedPipeline {
-        let shader = compile_wgsl(&self.device, shader_path, defines);
+        let shader = compile_wgsl(&self.device, shader_path.as_ref(), defines);
 
         // Identify textures that can actually use a sampler (non-integer, non-multisampled)
         let samplable_textures: Vec<_> = input_specs
@@ -402,7 +402,7 @@ impl ComputeSystem {
         let pipeline = self
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
-                label: Some(shader_path.to_str().unwrap_or("")),
+                label: Some(shader_path.as_ref().to_str().unwrap_or("")),
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: Some("main"),

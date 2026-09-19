@@ -576,7 +576,7 @@ impl RenderManager {
         label: &str,
         input_views: Vec<&TextureView>,
         output_views: Vec<&TextureView>,
-        shader_path: &PathBuf,
+        shader_path: impl AsRef<Path>,
         options: ComputePipelineOptions,
         buffer_sets: &[BufferSet],
     ) {
