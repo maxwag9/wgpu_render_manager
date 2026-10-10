@@ -564,7 +564,9 @@ impl RenderManager {
     /// ## WGSL expectations
     /// - Entry point: `@compute @workgroup_size(...) fn main()`
     /// - Input textures must match the order given
-    /// - Output textures must be `texture_storage_2d<... , write>`
+    /// - Input texture view dimensions are inferred from their backing textures.
+    /// - Output storage texture dimensions are inferred from their backing textures.
+    /// - Supports 1D, 2D, 2D-array, and 3D storage textures.
     /// - Uniforms/Storage(read_write) must match binding indices exactly
     ///
     /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl), which adds a small

@@ -22,15 +22,15 @@ impl Default for ComputePipelineOptions {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PipelineKey {
     shader_path: String,
-    input_specs: Vec<(TextureFormat, u32, bool)>, // (format, sample_count, is_filterable)
-    output_formats: Vec<TextureFormat>,
+    input_specs: Vec<(TextureFormat, u32, bool, TextureViewDimension)>, // (format, sample_count, is_filterable)
+    output_specs: Vec<(TextureFormat, TextureViewDimension)>,
     buffer_bindings: Vec<BufferBindingType>,
-    defines_hash: u64,
+    defines_hash: u64
 }
 
 struct CachedPipeline {
     pipeline: ComputePipeline,
-    bind_group_layouts: [BindGroupLayout; 3],
+    bind_group_layouts: [BindGroupLayout; 3]
 }
 
 #[derive(Debug)]
@@ -158,16 +158,24 @@ impl ComputeSystem {
 
         let input_specs: Vec<_> = input_views
             .iter()
-            .map(|v| {
-                let tex = v.texture();
-                let format = tex.format();
-                let sample_count = tex.sample_count();
+            .map(|view| {
+                let texture = view.texture();
+                let format = texture.format();
+                let sample_count = texture.sample_count();
                 let is_filterable = self.is_format_filterable(format, sample_count);
-                (format, sample_count, is_filterable)
+                let view_dimension = infer_texture_view_dimension(view);
+
+                (format, sample_count, is_filterable, view_dimension)
             })
             .collect();
 
-        let output_formats: Vec<_> = output_views.iter().map(|v| v.texture().format()).collect();
+        let output_specs: Vec<_> = output_views
+            .iter()
+            .map(|view| {
+                let texture = view.texture();
+                (texture.format(), infer_texture_view_dimension(view))
+            })
+            .collect();
         let buffer_bindings: Vec<_> = buffer_sets
             .iter()
             .map(|b| buffer_binding_type(b))
@@ -176,9 +184,9 @@ impl ComputeSystem {
         let key = PipelineKey {
             shader_path: shader_path.to_str().unwrap_or("").to_string(),
             input_specs: input_specs.clone(),
-            output_formats: output_formats.clone(),
+            output_specs: output_specs.clone(),
             buffer_bindings: buffer_bindings.clone(),
-            defines_hash: hash_defines(defines)
+            defines_hash: hash_defines(defines),
         };
 
         // Get or create cached pipeline
@@ -186,7 +194,7 @@ impl ComputeSystem {
             let cached = self.create_pipeline(
                 shader_path,
                 &input_specs,
-                &output_formats,
+                &output_specs,
                 &buffer_bindings,
                 defines
             );
@@ -196,9 +204,11 @@ impl ComputeSystem {
         let cached = self.pipeline_cache.get(&key).unwrap();
 
         // Determine if we can use filtering sampler
-        let use_filtering = input_specs.iter().all(|(format, sample_count, is_filterable)| {
-            format.has_depth_aspect() || *sample_count > 1 || *is_filterable
-        });
+        let use_filtering = input_specs
+            .iter()
+            .all(|(format, sample_count, is_filterable, _)| {
+                format.has_depth_aspect() || *sample_count > 1 || *is_filterable
+            });
 
         // Create bind groups
         let input_bg = self.create_input_bind_group(&cached.bind_group_layouts[0], &input_views, use_filtering);
@@ -261,13 +271,11 @@ impl ComputeSystem {
     //     pass                         // Your own pass!
     // );
 
-
-
     fn create_pipeline(
         &self,
         shader_path: impl AsRef<Path>,
-        input_specs: &[(TextureFormat, u32, bool)], // (format, sample_count, is_filterable)
-        output_formats: &[TextureFormat],
+        input_specs: &[(TextureFormat, u32, bool, TextureViewDimension)], // (format, sample_count, is_filterable)
+        output_specs: &[(TextureFormat, TextureViewDimension)],
         buffer_bindings: &[BufferBindingType],
         defines: &HashMap<String, bool>,
     ) -> CachedPipeline {
@@ -276,32 +284,34 @@ impl ComputeSystem {
         // Identify textures that can actually use a sampler (non-integer, non-multisampled)
         let samplable_textures: Vec<_> = input_specs
             .iter()
-            .filter(|(format, sample_count, _)| {
+            .filter(|(format, sample_count, _, _)| {
                 !is_integer_format(*format) && *sample_count == 1
             })
             .collect();
 
         // Can only use filtering if ALL samplable textures support it
         let use_filtering = samplable_textures.is_empty()
-            || samplable_textures.iter().all(|(format, _, is_filterable)| {
-            // Depth textures use comparison samplers, so they don't affect filtering choice
-            format.has_depth_aspect() || *is_filterable
-        });
+            || samplable_textures
+            .iter()
+            .all(|(format, _, is_filterable, _)| {
+                format.has_depth_aspect() || *is_filterable
+            });
 
         // Group 0: input textures + sampler
         let mut input_entries: Vec<BindGroupLayoutEntry> = input_specs
             .iter()
             .enumerate()
-            .map(|(i, (format, sample_count, is_filterable))| {
+            .map(|(i, (format, sample_count, is_filterable, view_dimension))| {
                 let multisampled = *sample_count > 1;
-                let sample_type = get_texture_sample_type(*format, *is_filterable, multisampled);
+                let sample_type =
+                    get_texture_sample_type(*format, *is_filterable, multisampled);
 
                 BindGroupLayoutEntry {
                     binding: i as u32,
                     visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Texture {
                         sample_type,
-                        view_dimension: TextureViewDimension::D2,
+                        view_dimension: *view_dimension,
                         multisampled,
                     },
                     count: None,
@@ -333,11 +343,10 @@ impl ComputeSystem {
             });
 
         // Group 1: output storage textures
-        let output_entries: Vec<BindGroupLayoutEntry> = output_formats
+        let output_entries: Vec<BindGroupLayoutEntry> = output_specs
             .iter()
             .enumerate()
-            .map(|(i, format)| {
-                // Warn if format might not support storage
+            .map(|(i, (format, view_dimension))| {
                 #[cfg(debug_assertions)]
                 if !is_storage_compatible(*format) {
                     eprintln!(
@@ -352,7 +361,7 @@ impl ComputeSystem {
                     ty: BindingType::StorageTexture {
                         access: StorageTextureAccess::WriteOnly,
                         format: *format,
-                        view_dimension: TextureViewDimension::D2,
+                        view_dimension: *view_dimension,
                     },
                     count: None,
                 }
@@ -619,4 +628,20 @@ fn is_storage_compatible(format: TextureFormat) -> bool {
             | R16Uint | R16Sint | Rg16Uint | Rg16Sint
             | Bgra8Unorm
         )
+}
+
+fn infer_texture_view_dimension(view: &TextureView) -> TextureViewDimension {
+    let texture = view.texture();
+
+    match texture.dimension() {
+        TextureDimension::D1 => TextureViewDimension::D1,
+        TextureDimension::D2 => {
+            if texture.depth_or_array_layers() > 1 {
+                TextureViewDimension::D2Array
+            } else {
+                TextureViewDimension::D2
+            }
+        }
+        TextureDimension::D3 => TextureViewDimension::D3,
+    }
 }
