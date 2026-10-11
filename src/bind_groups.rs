@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Device, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages, TextureAspect, TextureSampleType, TextureView, TextureViewDimension};
+use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Device, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages, TextureAspect, TextureDimension, TextureSampleType, TextureView, TextureViewDimension};
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct MaterialBindGroupKey {
@@ -123,10 +123,13 @@ impl MaterialBindGroups {
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Texture {
                         multisampled: is_multisampled,
-                        view_dimension: if tex.depth_or_array_layers() > 1 {
-                            TextureViewDimension::D2Array
-                        } else {
-                            TextureViewDimension::D2
+                        view_dimension: match tex.dimension() {
+                            TextureDimension::D1 => TextureViewDimension::D1,
+                            TextureDimension::D2 if tex.depth_or_array_layers() > 1 => {
+                                TextureViewDimension::D2Array
+                            }
+                            TextureDimension::D2 => TextureViewDimension::D2,
+                            TextureDimension::D3 => TextureViewDimension::D3,
                         },
                         sample_type,
                     },
