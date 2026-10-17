@@ -6,6 +6,45 @@ use std::path::{Path, PathBuf};
 use wgpu::*;
 use crate::shader_preprocessing::compile_wgsl;
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum BufferBindingKind {
+    Uniform,
+    StorageReadOnly,
+    StorageReadWrite,
+}
+
+#[derive(Clone, Copy)]
+pub struct RendererBufferBinding<'a> {
+    pub buffer: &'a Buffer,
+    pub kind: BufferBindingKind,
+}
+
+impl<'a> RendererBufferBinding<'a> {
+    /// Creates a binding for a uniform buffer.
+    pub fn uniform(buffer: &'a Buffer) -> Self {
+        Self {
+            buffer,
+            kind: BufferBindingKind::Uniform,
+        }
+    }
+
+    /// Creates a binding for a read-only storage buffer.
+    pub fn storage_read_only(buffer: &'a Buffer) -> Self {
+        Self {
+            buffer,
+            kind: BufferBindingKind::StorageReadOnly,
+        }
+    }
+
+    /// Creates a binding for a read-write storage buffer.
+    pub fn storage_read_write(buffer: &'a Buffer) -> Self {
+        Self {
+            buffer,
+            kind: BufferBindingKind::StorageReadWrite,
+        }
+    }
+}
+
 /// Options required to enable shadow sampling in a render pipeline.
 ///
 /// When provided, the pipeline will expose additional bindings for
@@ -243,6 +282,7 @@ pub struct PipelineCache {
     shaders: HashMap<ShaderKey, ShaderEntry>,
     pipelines: HashMap<PipelineKey, RenderPipeline>,
     pub(crate) uniform_layouts: HashMap<usize, BindGroupLayout>,
+    pub(crate) buffer_layouts: HashMap<Vec<BufferBindingKind>, BindGroupLayout>,
 }
 
 impl PipelineCache {
@@ -252,6 +292,7 @@ impl PipelineCache {
             shaders: HashMap::new(),
             pipelines: HashMap::new(),
             uniform_layouts: HashMap::new(),
+            buffer_layouts: HashMap::new(),
         }
     }
 
@@ -282,6 +323,55 @@ impl PipelineCache {
             self.uniform_layouts.insert(buffer_count, layout);
         }
         self.uniform_layouts.get(&buffer_count).unwrap()
+    }
+
+    // Very kind kinds.
+    /// Get or create a uniform bind group layout for N buffer kinds.
+    pub(crate) fn buffer_layout(
+        &mut self,
+        kinds: &[BufferBindingKind],
+    ) -> &BindGroupLayout {
+        let key = kinds.to_vec();
+
+        if !self.buffer_layouts.contains_key(&key) {
+            let entries: Vec<BindGroupLayoutEntry> = key
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| {
+                    let ty = match *kind {
+                        BufferBindingKind::Uniform => BufferBindingType::Uniform,
+                        BufferBindingKind::StorageReadOnly => {
+                            BufferBindingType::Storage { read_only: true }
+                        }
+                        BufferBindingKind::StorageReadWrite => {
+                            BufferBindingType::Storage { read_only: false }
+                        }
+                    };
+
+                    BindGroupLayoutEntry {
+                        binding: i as u32,
+                        visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }
+                })
+                .collect();
+
+            let layout = self.device.create_bind_group_layout(
+                &BindGroupLayoutDescriptor {
+                    label: Some(&format!("typed buffer layout ({})", key.len())),
+                    entries: &entries,
+                },
+            );
+
+            self.buffer_layouts.insert(key.clone(), layout);
+        }
+
+        self.buffer_layouts.get(&key).unwrap()
     }
 
     /// Create a bind group from uniform buffers.

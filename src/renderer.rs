@@ -3,11 +3,27 @@ use crate::bind_groups::{LayoutKey, MaterialBindGroups};
 use crate::compute_system::{BufferSet, ComputePipelineOptions, ComputeSystem};
 use crate::fullscreen::{DebugVisualization, DepthDebugParams, FullscreenRenderer};
 use crate::generator::{TextureGenerator, TextureKey};
-use crate::pipelines::{PipelineCache, PipelineOptions};
+use crate::pipelines::{RendererBufferBinding, PipelineCache, PipelineOptions, BufferBindingKind};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use wgpu::{BindGroup, BindGroupLayout, Buffer, CommandEncoder, Device, Queue, RenderPass, TextureView};
+use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, Buffer, CommandEncoder, Device, Queue, RenderPass, TextureView};
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct BufferBindGroupKey(u64);
+
+impl BufferBindGroupKey {
+    fn from_bindings(bindings: &[RendererBufferBinding<'_>]) -> Self {
+        let mut hasher = DefaultHasher::default();
+
+        for binding in bindings {
+            binding.buffer.hash(&mut hasher);
+            binding.kind.hash(&mut hasher);
+        }
+
+        Self(hasher.finish())
+    }
+}
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct UniformBindGroupKey(u64);
@@ -99,6 +115,7 @@ pub struct RenderManager {
     materials: MaterialBindGroups,
     compute_system: ComputeSystem,
     uniform_bind_groups: HashMap<UniformBindGroupKey, BindGroup>,
+    buffer_bind_groups: HashMap<BufferBindGroupKey, BindGroup>,
     defines: HashMap<String, bool>,
     texture_array: TextureArrayData,
     texture_array_map: HashMap<TextureKey, u32>
@@ -129,6 +146,7 @@ impl RenderManager {
             materials,
             compute_system,
             uniform_bind_groups: HashMap::new(),
+            buffer_bind_groups: HashMap::new(),
             defines: HashMap::new(),
             texture_array: TextureArrayData::empty(device, 32),
             texture_array_map: HashMap::new()
@@ -478,6 +496,214 @@ impl RenderManager {
             pass.set_bind_group(i as u32, *bg, &[]);
         }
     }
+
+    /// Render using generated textures and explicitly typed buffer bindings.
+    ///
+    /// Use this when textures should be obtained from the procedural texture
+    /// generator and the shader requires a mixture of uniform and storage
+    /// buffers.
+    ///
+    /// This method automatically:
+    /// - Creates or reuses the material bind group
+    /// - Sets up optional shadow bindings
+    /// - Creates or reuses the typed buffer bind group
+    /// - Creates or reuses the render pipeline for the specified layouts
+    ///
+    /// Like [`render`](Self::render), this does not issue a draw call.
+    ///
+    /// ## Shader Binding Layout
+    /// - `@group(0)`: Material bindings, including the sampler, texture array,
+    ///   input textures, and optional shadow bindings
+    /// - `@group(1) @binding(0..n)`: Explicitly typed buffers, in the same order
+    ///   as the input `bindings` slice
+    ///
+    /// Each buffer's [`BufferBindingKind`] determines its WGSL binding type:
+    /// - `Uniform`: `var<uniform>`
+    /// - `StorageReadOnly`: `var<storage, read>`
+    /// - `StorageReadWrite`: `var<storage, read_write>`
+    ///
+    /// Buffer binding indices start at zero and increase sequentially. The
+    /// shader's binding declarations must match the supplied buffer order and
+    /// types.
+    ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl),
+    /// which adds a compile-time preprocessing layer (`#ifdef`, `#include`)
+    /// before passing the resulting WGSL to wgpu.
+    ///
+    /// ## Example
+    /// ```no_run
+    /// render_manager.render_with_buffer_bindings(
+    ///     &texture_keys,
+    ///     shader_path,
+    ///     &options,
+    ///     &[
+    ///         BufferBinding::uniform(&camera_buffer),
+    ///         BufferBinding::storage_read_only(&exposure_buffer),
+    ///     ],
+    ///     &mut render_pass,
+    /// );
+    /// ```
+    pub fn render_with_buffer_bindings(
+        &mut self,
+        texture_keys: &[TextureKey],
+        shader_path: impl AsRef<Path>,
+        options: &PipelineOptions,
+        bindings: &[RendererBufferBinding<'_>],
+        pass: &mut RenderPass,
+    ) {
+        let mut owned_views: Vec<TextureView> =
+            Vec::with_capacity(texture_keys.len());
+
+        for key in texture_keys {
+            owned_views.push(self.generator.get_or_create(key).clone());
+        }
+
+        let view_refs: Vec<&TextureView> = owned_views.iter().collect();
+
+        self.render_with_textures_and_buffer_bindings(
+            &view_refs,
+            shader_path,
+            options,
+            bindings,
+            pass,
+        );
+    }
+
+    /// Render using pre-existing texture views and explicitly typed buffer bindings.
+    ///
+    /// Use this when textures originate from sources other than the procedural
+    /// texture generator, such as render targets, externally created textures,
+    /// or intermediate render-pass outputs.
+    ///
+    /// This method automatically:
+    /// - Creates or reuses the material bind group
+    /// - Sets up optional shadow bindings
+    /// - Creates or reuses the typed buffer bind group
+    /// - Creates or reuses the render pipeline for the specified layouts
+    ///
+    /// Like [`render`](Self::render), this does not issue a draw call.
+    ///
+    /// ## Shader Binding Layout
+    /// - `@group(0)`: Material bindings, including the sampler, texture array,
+    ///   input textures, and optional shadow bindings
+    /// - `@group(1) @binding(0..n)`: Explicitly typed buffers, in the same order
+    ///   as the input `bindings` slice
+    ///
+    /// Each buffer's [`BufferBindingKind`] determines its WGSL binding type:
+    /// - `Uniform`: `var<uniform>`
+    /// - `StorageReadOnly`: `var<storage, read>`
+    /// - `StorageReadWrite`: `var<storage, read_write>`
+    ///
+    /// Buffer binding indices start at zero and increase sequentially. The
+    /// shader's binding declarations must match the supplied buffer order and
+    /// types.
+    ///
+    /// WGSL shaders are compiled via [`compile_wgsl()`](crate::shader_preprocessing::compile_wgsl),
+    /// which adds a compile-time preprocessing layer (`#ifdef`, `#include`)
+    /// before passing the resulting WGSL to wgpu.
+    ///
+    /// ## Example
+    /// ```no_run
+    /// render_manager.render_with_textures_and_buffer_bindings(
+    ///     &texture_views,
+    ///     shader_path,
+    ///     &options,
+    ///     &[
+    ///         BufferBinding::uniform(&post_processing_buffer),
+    ///         BufferBinding::storage_read_only(&exposure_buffer),
+    ///     ],
+    ///     &mut render_pass,
+    /// );
+    /// ```
+    pub fn render_with_textures_and_buffer_bindings(
+        &mut self,
+        texture_views: &[&TextureView],
+        shader_path: impl AsRef<Path>,
+        options: &PipelineOptions,
+        bindings: &[RendererBufferBinding<'_>],
+        pass: &mut RenderPass,
+    ) {
+        let shadow = options.shadow.as_ref().map(|s| (&s.sampler, &s.view));
+        let has_shadow = shadow.is_some();
+
+        let _ = self.materials.layout(texture_views, has_shadow);
+
+        let material_layout_handle = self
+            .materials
+            .layouts
+            .get(&LayoutKey::from_views(texture_views, has_shadow))
+            .expect("material layout must exist")
+            .clone();
+
+        let mut owned_bgls: Vec<BindGroupLayout> = Vec::with_capacity(2);
+        owned_bgls.push(material_layout_handle);
+
+        if !bindings.is_empty() {
+            let kinds: Vec<BufferBindingKind> =
+                bindings.iter().map(|binding| binding.kind).collect();
+
+            let buffer_layout = self.pipeline_cache.buffer_layout(&kinds).clone();
+            owned_bgls.push(buffer_layout);
+        }
+
+        let bind_group_layout_refs: Vec<Option<&BindGroupLayout>> =
+            owned_bgls.iter().map(|bgl| Some(bgl)).collect();
+
+        let shader_path = shader_path.as_ref();
+
+        let pipeline = self
+            .pipeline_cache
+            .get_or_create(
+                shader_path,
+                &bind_group_layout_refs,
+                options,
+                &self.defines,
+            )
+            .clone();
+
+        pass.set_pipeline(&pipeline);
+
+        let material_bg = self.materials.get_or_create(
+            texture_views,
+            shadow,
+            &options.sampler,
+            &self.texture_array.view,
+        );
+
+        pass.set_bind_group(0, material_bg, &[]);
+
+        if !bindings.is_empty() {
+            let key = BufferBindGroupKey::from_bindings(bindings);
+
+            if !self.buffer_bind_groups.contains_key(&key) {
+                let entries: Vec<BindGroupEntry> = bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(i, binding)| BindGroupEntry {
+                        binding: i as u32,
+                        resource: binding.buffer.as_entire_binding(),
+                    })
+                    .collect();
+
+                let bind_group = self.device.create_bind_group(
+                    &BindGroupDescriptor {
+                        label: Some("typed buffer bind group"),
+                        layout: &owned_bgls[1],
+                        entries: &entries,
+                    },
+                );
+
+                self.buffer_bind_groups.insert(key.clone(), bind_group);
+            }
+
+            pass.set_bind_group(
+                1,
+                self.buffer_bind_groups.get(&key).unwrap(),
+                &[],
+            );
+        }
+    }
+
     /// Render a fullscreen debug visualization of a texture.
     ///
     /// This is primarily intended for inspecting intermediate render
@@ -635,6 +861,7 @@ impl RenderManager {
         self.materials.clear();
         self.fullscreen.invalidate_bind_groups();
         self.uniform_bind_groups.clear();
+        self.buffer_bind_groups.clear();
     }
 
     /// Reload render shaders from disk.
