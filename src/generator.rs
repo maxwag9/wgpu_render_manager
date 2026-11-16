@@ -1411,6 +1411,45 @@ impl TextureGenerator {
 
         self.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    pub fn gpu_memory_usage_bytes(&self) -> u64 {
+        self.cache.values().map(|cached| {
+            let size = cached.texture.size();
+            let format = cached.texture.format();
+            let mip_count = cached.texture.mip_level_count();
+
+            (0..mip_count).map(|mip| {
+                let width = (size.width >> mip).max(1) as u64;
+                let height = (size.height >> mip).max(1) as u64;
+
+                match format {
+                    wgpu::TextureFormat::Bc7RgbaUnorm
+                    | wgpu::TextureFormat::Bc7RgbaUnormSrgb => {
+                        width.div_ceil(4) * height.div_ceil(4) * 16
+                    }
+                    wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb => {
+                        width * height * 4
+                    }
+                    _ => 0,
+                }
+            }).sum::<u64>()
+        }).sum()
+    }
+
+    pub fn gpu_memory_usage_uncompressed_bytes(&self) -> u64 {
+        self.cache.values().map(|cached| {
+            let size = cached.texture.size();
+            let mip_count = size.max_mips(wgpu::TextureDimension::D2);
+
+            (0..mip_count).map(|mip| {
+                let width = (size.width >> mip).max(1) as u64;
+                let height = (size.height >> mip).max(1) as u64;
+
+                width * height * 4
+            }).sum::<u64>()
+        }).sum()
+    }
 }
 
 

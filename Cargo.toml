@@ -1,6 +1,6 @@
 [package]
 name = "wgpu_render_manager"
-version = "30.0.10"
+version = "30.0.11"
 edition = "2024"
 
 authors = ["Maxim Wagner"]
@@ -13,9 +13,9 @@ keywords = ["wgpu", "graphics", "rendering", "compute", "gpu"]
 categories = ["graphics", "rendering", "game-development"]
 
 [dependencies]
-wgpu = "30.0.0"
-bytemuck = "1.12.0"
-serde = { version = "1.0.228", features = ["derive"] }
+wgpu = "30"
+bytemuck = "1"
+serde = { version = "1", features = ["derive"] }
 revision = "0.30.0"
 block_compression = { version = "0.11", default-features = false, features = ["bc7", "wgpu"] }
-tracing = "0.1.44"
+tracing = "0.1"
