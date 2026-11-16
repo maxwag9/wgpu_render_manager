@@ -1450,6 +1450,18 @@ impl TextureGenerator {
             }).sum::<u64>()
         }).sum()
     }
+    pub fn uncompressed_texture_keys(&self) -> Vec<&TextureKey> {
+        self.cache
+            .iter()
+            .filter_map(|(key, cached)| {
+                match cached.texture.format() {
+                    wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb => Some(key),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
 }
 
 

@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu_render_manager"
-version = "30.0.11"
+version = "30.0.12"
 dependencies = [
  "block_compression",
  "bytemuck",
