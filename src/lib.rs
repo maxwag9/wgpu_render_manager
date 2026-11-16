@@ -42,6 +42,6 @@ pub mod generator;
 pub mod pipelines;
 pub mod fullscreen;
 pub mod renderer;
-mod bind_groups;
-mod shader_preprocessing;
+pub mod bind_groups;
+pub mod shader_preprocessing;
 pub mod mipmapping;

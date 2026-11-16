@@ -32,6 +32,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+use block_compression::{BC7Settings, CompressionVariant, GpuBlockCompressor};
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
@@ -143,6 +144,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const DOWNSAMPLE_PIPELINE_KEY: &str = "__downsample__";
 const COVERAGE_PIPELINE_KEY: &str = "__coverage__";
+const ALPHA_PRESERVING_DOWNSAMPLE_PIPELINE_KEY: &str = "__alpha_preserving_downsample__";
 const ALPHA_TEST_THRESHOLD: f32 = 0.5;
 
 #[repr(C)]
@@ -163,8 +165,20 @@ struct CoverageParams {
     _pad2: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AlphaPreservingParams {
+    base_pixel_count: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
 const DOWNSAMPLE_SHADER: &str = include_str!("shaders/downsample.wgsl");
 const COVERAGE_SHADER: &str = include_str!("shaders/coverage.wgsl");
+
+const ALPHA_PRESERVING_DOWNSAMPLE_SHADER: &str =
+    include_str!("shaders/downsample_alpha_preserving.wgsl");
 
 /// Parameters passed to procedural texture generation shaders.
 ///
@@ -304,7 +318,24 @@ pub enum MipmapMode {
     /// Useful for leaves of trees.
     AlphaPreserving
 }
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[revisioned(revision = 1)]
+pub enum TextureCompressionMode {
+    #[default]
+    None,
+    Bc7,
+    Bc7Opaque,
+}
 
+impl TextureCompressionMode {
+    fn variant(self) -> Option<CompressionVariant> {
+        match self {
+            Self::None => None,
+            Self::Bc7 => Some(CompressionVariant::BC7(BC7Settings::alpha_fast())),
+            Self::Bc7Opaque => Some(CompressionVariant::BC7(BC7Settings::opaque_fast())),
+        }
+    }
+}
 /// Key used for procedural texture caching.
 ///
 /// Textures are uniquely identified by:
@@ -314,13 +345,15 @@ pub enum MipmapMode {
 ///
 /// Identical keys will always reuse the same cached texture.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-#[revisioned(revision = 2)]
+#[revisioned(revision = 3)]
 pub struct TextureKey {
     pub shader_id: PathBuf,
     pub params: TextureParams,
     pub resolution: u32,
     #[revision(start = 2)]
-    pub mipmap_mode: MipmapMode
+    pub mipmap_mode: MipmapMode,
+    #[revision(start = 3)]
+    pub compression: TextureCompressionMode,
 }
 impl Default for TextureKey {
     fn default() -> Self {
@@ -328,12 +361,13 @@ impl Default for TextureKey {
     }
 }
 impl TextureKey {
-    pub fn new(shader_id: impl Into<PathBuf>, params: TextureParams, resolution: u32, mipmap_mode: MipmapMode) -> Self {
+    pub fn new(shader_id: impl Into<PathBuf>, params: TextureParams, resolution: u32, mipmap_mode: MipmapMode, compression: TextureCompressionMode) -> Self {
         Self {
             shader_id: shader_id.into(),
             params,
             resolution,
-            mipmap_mode
+            mipmap_mode,
+            compression
         }
     }
     pub fn notex() -> Self {
@@ -341,9 +375,15 @@ impl TextureKey {
             shader_id: PathBuf::from_str("notex").unwrap_or_default(),
             params: TextureParams::default(),
             resolution: 128,
-            mipmap_mode: MipmapMode::Generate
+            mipmap_mode: MipmapMode::Generate,
+            compression: TextureCompressionMode::Bc7,
         }
     }
+    pub fn with_compression(mut self, compression: TextureCompressionMode) -> Self {
+        self.compression = compression;
+        self
+    }
+
 }
 
 struct CachedTexture {
@@ -373,7 +413,8 @@ pub struct TextureGenerator {
     device: Device,
     queue: Queue,
     pipelines: HashMap<PathBuf, ComputePipeline>,
-    cache: HashMap<TextureKey, CachedTexture>
+    cache: HashMap<TextureKey, CachedTexture>,
+    bc7_compressor: Option<GpuBlockCompressor>,
 }
 
 impl TextureGenerator {
@@ -385,10 +426,13 @@ impl TextureGenerator {
             device,
             queue,
             pipelines: HashMap::new(),
-            cache: HashMap::new()
+            cache: HashMap::new(),
+            bc7_compressor: None
         }
     }
-
+    pub fn required_device_features() -> wgpu::Features {
+        wgpu::Features::TEXTURE_COMPRESSION_BC
+    }
     /// Get or generate a procedural texture.
     ///
     /// If a texture matching the given [`TextureKey`] already exists,
@@ -496,10 +540,37 @@ impl TextureGenerator {
             depth_or_array_layers: 1,
         };
 
-        let mip_count = match key.mipmap_mode {
+        let full_mip_count = match key.mipmap_mode {
             MipmapMode::None => 1,
             MipmapMode::Generate | MipmapMode::GenerateDownsample | MipmapMode::AlphaPreserving => {
                 size.max_mips(wgpu::TextureDimension::D2)
+            }
+        };
+        let mut compressed_resolution_valid = false;
+        let mip_count = match key.compression {
+            TextureCompressionMode::None => full_mip_count,
+            TextureCompressionMode::Bc7 | TextureCompressionMode::Bc7Opaque => {
+                if key.resolution >= 4 && key.resolution % 4 == 0 {
+                    let mut compressed_mip_count = 0;
+                    for mip in 0..full_mip_count {
+                        let mip_width = (key.resolution >> mip).max(1);
+                        let mip_height = mip_width;
+                        if mip_width < 4 || mip_height < 4 || mip_width % 4 != 0 || mip_height % 4 != 0 {
+                            break;
+                        }
+                        compressed_mip_count += 1;
+                    }
+                    compressed_resolution_valid = true;
+                    compressed_mip_count
+                } else {
+                    compressed_resolution_valid = false;
+                    if tracing::dispatcher::has_been_set() {
+                        tracing::warn!("[Texture Generator] BC7 compression requires a texture resolution of at least 4 and divisible by 4. Falling back to no compression.");
+                    } else {
+                        //eprintln!("[Texture Generator] BC7 compression requires a texture resolution of at least 4 and divisible by 4. Falling back to no compression.");
+                    }
+                    full_mip_count
+                }
             }
         };
 
@@ -551,15 +622,37 @@ impl TextureGenerator {
 
             MipmapMode::AlphaPreserving => {
                 self.generate_base_mip(key, &texture, 0, key.resolution, key.resolution);
-                self.ensure_downsample_pipeline();
                 self.ensure_coverage_pipeline();
+                self.ensure_alpha_preserving_downsample_pipeline();
+
+                let base_counter = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("base alpha coverage counter"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                let mip_counter = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mip alpha coverage counter"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
 
                 let base_view = texture.create_view(&wgpu::TextureViewDescriptor {
                     base_mip_level: 0,
                     mip_level_count: Some(1),
                     ..Default::default()
                 });
-                let base_coverage = self.coverage_ratio(&base_view, key.resolution, key.resolution);
+
+                self.coverage_pass(
+                    &base_view,
+                    key.resolution,
+                    key.resolution,
+                    &base_counter,
+                );
+
+                let base_pixel_count = key.resolution as f32 * key.resolution as f32;
 
                 for mip in 1..mip_count {
                     let src_view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -567,36 +660,277 @@ impl TextureGenerator {
                         mip_level_count: Some(1),
                         ..Default::default()
                     });
+
                     let dst_view = texture.create_view(&wgpu::TextureViewDescriptor {
                         base_mip_level: mip,
                         mip_level_count: Some(1),
                         ..Default::default()
                     });
-                    let dst_w = (key.resolution >> mip).max(1);
-                    let dst_h = (key.resolution >> mip).max(1);
 
-                    let mut scale = 1.0f32;
+                    let dst_w = (key.resolution >> mip).max(1);
+                    let dst_h = dst_w;
+
+                    self.alpha_preserving_downsample_pass(
+                        &src_view,
+                        &dst_view,
+                        dst_w,
+                        dst_h,
+                        base_pixel_count,
+                        &base_counter,
+                        &mip_counter,
+                        true,
+                    );
+
+                    self.coverage_pass(
+                        &dst_view,
+                        dst_w,
+                        dst_h,
+                        &mip_counter,
+                    );
+
                     for _ in 0..3 {
-                        self.downsample_pass(&src_view, &dst_view, dst_w, dst_h, scale);
-                        let mip_coverage = self.coverage_ratio(&dst_view, dst_w, dst_h);
-                        if mip_coverage < 0.0001 {
-                            break;
-                        }
-                        let ratio = (base_coverage / mip_coverage).clamp(0.5, 4.0);
-                        if (ratio - 1.0).abs() < 0.01 {
-                            break;
-                        }
-                        scale = (scale * ratio).clamp(1.0, 32.0);
+                        self.alpha_preserving_downsample_pass(
+                            &src_view,
+                            &dst_view,
+                            dst_w,
+                            dst_h,
+                            base_pixel_count,
+                            &base_counter,
+                            &mip_counter,
+                            false,
+                        );
+
+                        self.coverage_pass(
+                            &dst_view,
+                            dst_w,
+                            dst_h,
+                            &mip_counter,
+                        );
                     }
                 }
             }
         }
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (texture, view) = match key.compression {
+            TextureCompressionMode::None => {
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                (texture, view)
+            }
+            TextureCompressionMode::Bc7 | TextureCompressionMode::Bc7Opaque => {
+                if compressed_resolution_valid {
+                    self.compress_bc7(key, &texture, mip_count)
+                        .unwrap_or_else(|| {
+                            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                            (texture, view)
+                        })
+                } else {
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    (texture, view)
+                }
+            }
+        };
+
         self.cache.insert(key.clone(), CachedTexture {
             texture,
             view,
         });
+    }
+
+    fn compress_bc7(
+        &mut self,
+        key: &TextureKey,
+        source: &wgpu::Texture,
+        mip_count: u32,
+    ) -> Option<(wgpu::Texture, TextureView)> {
+        let Some(variant) = key.compression.variant() else {
+            tracing::warn!(
+            "[Texture Generator] No BC7 compression variant available for {:?}. Falling back to no compression.",
+            key.shader_id
+        );
+            return None;
+        };
+
+        if !self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+            tracing::warn!(
+            "[Texture Generator] BC7 compression requested for {:?}, but TEXTURE_COMPRESSION_BC is unavailable. Falling back to no compression.",
+            key.shader_id
+        );
+            return None;
+        }
+
+        if mip_count == 0 {
+            tracing::warn!(
+            "[Texture Generator] BC7 compression requested for {:?}, but the mip count is zero. Falling back to no compression.",
+            key.shader_id
+        );
+            return None;
+        }
+
+        let device = &self.device;
+        let max_storage_binding_size = device.limits().max_storage_buffer_binding_size as u64;
+        let max_buffer_size = device.limits().max_buffer_size;
+
+        let mut mip_sizes = Vec::with_capacity(mip_count as usize);
+
+        for mip in 0..mip_count {
+            let mip_width = (key.resolution >> mip).max(1);
+            let mip_height = mip_width;
+
+            if mip_width < 4 || mip_width % 4 != 0 {
+                tracing::warn!(
+                "[Texture Generator] BC7 compression requested for {:?}, but mip {} has incompatible dimensions {}x{}. Falling back to no compression.",
+                key.shader_id,
+                mip,
+                mip_width,
+                mip_height
+            );
+                return None;
+            }
+
+            let buffer_size = variant.blocks_byte_size(mip_width, mip_height) as u64;
+
+            if buffer_size == 0
+                || buffer_size > max_storage_binding_size
+                || buffer_size > max_buffer_size
+            {
+                tracing::warn!(
+                "[Texture Generator] BC7 compression requested for {:?}, but mip {} requires a {} byte buffer, exceeding device limits (storage binding: {}, buffer: {}). Falling back to no compression.",
+                key.shader_id,
+                mip,
+                buffer_size,
+                max_storage_binding_size,
+                max_buffer_size
+            );
+                return None;
+            }
+
+            mip_sizes.push((mip_width, mip_height, buffer_size));
+        }
+
+        let compressed_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("BC7 procedural texture {:?}", key.shader_id)),
+            size: wgpu::Extent3d {
+                width: key.resolution,
+                height: key.resolution,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bc7RgbaUnorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let compressor = self.bc7_compressor.get_or_insert_with(|| {
+            GpuBlockCompressor::new(device.clone(), self.queue.clone())
+        });
+
+        let mut mip_buffers = Vec::with_capacity(mip_count as usize);
+
+        for (mip, &(mip_width, mip_height, buffer_size)) in mip_sizes.iter().enumerate() {
+            let source_view = source.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: mip as u32,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+
+            let compressed_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("BC7 compressed mip blocks"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+
+            compressor.add_compression_task(
+                variant,
+                &source_view,
+                mip_width,
+                mip_height,
+                &compressed_buffer,
+                None,
+                None,
+            );
+
+            mip_buffers.push(compressed_buffer);
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("BC7 texture compression and upload"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("BC7 compression pass"),
+                timestamp_writes: None,
+            });
+            compressor.compress(&mut pass);
+        }
+
+        for (mip, compressed_buffer) in mip_buffers.iter().enumerate() {
+            let mip = mip as u32;
+            let (mip_width, mip_height, _) = mip_sizes[mip as usize];
+            let bytes_per_row = variant.bytes_per_row(mip_width);
+            let block_rows = mip_height / 4;
+
+            if bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0 || block_rows == 1 {
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: compressed_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: (block_rows > 1).then_some(bytes_per_row),
+                            rows_per_image: (block_rows > 1).then_some(block_rows),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &compressed_texture,
+                        mip_level: mip,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: mip_width,
+                        height: mip_height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            } else {
+                for block_row in 0..block_rows {
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: compressed_buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: (block_row * bytes_per_row) as u64,
+                                bytes_per_row: None,
+                                rows_per_image: None,
+                            },
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &compressed_texture,
+                            mip_level: mip,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: block_row * 4,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: mip_width,
+                            height: 4,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let view = compressed_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Some((compressed_texture, view))
     }
     fn generate_base_mip(&mut self, key: &TextureKey, texture: &wgpu::Texture, mip: u32, mip_w: u32, mip_h: u32) {
         let pipeline_entry = self.pipelines.get(&key.shader_id).unwrap();
@@ -718,7 +1052,94 @@ impl TextureGenerator {
             bind_group_layout,
         });
     }
+    fn ensure_alpha_preserving_downsample_pipeline(&mut self) {
+        let key = PathBuf::from_str(ALPHA_PRESERVING_DOWNSAMPLE_PIPELINE_KEY).unwrap_or_default();
 
+        if self.pipelines.contains_key(&key) {
+            return;
+        }
+
+        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alpha preserving downsample"),
+            source: wgpu::ShaderSource::Wgsl(ALPHA_PRESERVING_DOWNSAMPLE_SHADER.into()),
+        });
+
+        let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alpha preserving downsample bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alpha preserving downsample pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alpha preserving downsample pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        self.pipelines.insert(key, ComputePipeline {
+            pipeline,
+            bind_group_layout,
+        });
+    }
     fn ensure_coverage_pipeline(&mut self) {
         if self.pipelines.contains_key(&PathBuf::from_str(COVERAGE_PIPELINE_KEY).unwrap_or_default()) {
             return;
@@ -786,7 +1207,7 @@ impl TextureGenerator {
         });
     }
 
-    fn downsample_pass(&mut self, src_view: &wgpu::TextureView, dst_view: &wgpu::TextureView, dst_w: u32, dst_h: u32, alpha_scale: f32) {
+    fn downsample_pass(&mut self, src_view: &TextureView, dst_view: &TextureView, dst_w: u32, dst_h: u32, alpha_scale: f32) {
         let pipeline_entry = self.pipelines.get(&PathBuf::from_str(DOWNSAMPLE_PIPELINE_KEY).unwrap_or_default()).unwrap();
 
         let params = DownsampleParams {
@@ -845,14 +1266,95 @@ impl TextureGenerator {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
-    fn coverage_ratio(&mut self, src_view: &wgpu::TextureView, width: u32, height: u32) -> f32 {
-        let pipeline_entry = self.pipelines.get(&PathBuf::from_str(COVERAGE_PIPELINE_KEY).unwrap_or_default()).unwrap();
+    fn alpha_preserving_downsample_pass(
+        &self,
+        src_view: &TextureView,
+        dst_view: &TextureView,
+        dst_w: u32,
+        dst_h: u32,
+        base_pixel_count: f32,
+        base_counter: &wgpu::Buffer,
+        mip_counter: &wgpu::Buffer,
+        clear_mip_counter: bool,
+    ) {
+        let key = PathBuf::from_str(ALPHA_PRESERVING_DOWNSAMPLE_PIPELINE_KEY).unwrap_or_default();
+        let pipeline_entry = self.pipelines.get(&key).unwrap();
 
-        let counter_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("coverage counter"),
-            contents: bytemuck::bytes_of(&0u32),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        let params = AlphaPreservingParams {
+            base_pixel_count,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+
+        let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alpha preserving parameters"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alpha preserving downsample bind group"),
+            layout: &pipeline_entry.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(dst_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: base_counter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: mip_counter.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("alpha preserving downsample"),
+        });
+
+        if clear_mip_counter {
+            encoder.clear_buffer(mip_counter, 0, Some(4));
+        }
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alpha preserving downsample pass"),
+                timestamp_writes: None,
+            });
+
+            pass.set_pipeline(&pipeline_entry.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                dst_w.div_ceil(8),
+                dst_h.div_ceil(8),
+                1,
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn coverage_pass(
+        &self,
+        src_view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        counter_buffer: &wgpu::Buffer,
+    ) {
+        let key = PathBuf::from_str(COVERAGE_PIPELINE_KEY).unwrap_or_default();
+        let pipeline_entry = self.pipelines.get(&key).unwrap();
 
         let params = CoverageParams {
             threshold: ALPHA_TEST_THRESHOLD,
@@ -862,13 +1364,13 @@ impl TextureGenerator {
         };
 
         let uniform_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
+            label: Some("coverage parameters"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
+            label: Some("coverage bind group"),
             layout: &pipeline_entry.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -886,54 +1388,28 @@ impl TextureGenerator {
             ],
         });
 
-        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("coverage readback"),
-            size: 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("coverage measurement"),
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("coverage count"),
-        });
+        encoder.clear_buffer(counter_buffer, 0, Some(4));
 
         {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("coverage pass"),
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("coverage measurement pass"),
                 timestamp_writes: None,
             });
 
-            compute_pass.set_pipeline(&pipeline_entry.pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-
-            let workgroup_size = 8u32;
-            compute_pass.dispatch_workgroups(
-                width.div_ceil(workgroup_size),
-                height.div_ceil(workgroup_size),
+            pass.set_pipeline(&pipeline_entry.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(
+                width.div_ceil(8),
+                height.div_ceil(8),
                 1,
             );
         }
 
-        encoder.copy_buffer_to_buffer(&counter_buffer, 0, &readback_buffer, 0, 4);
         self.queue.submit(std::iter::once(encoder.finish()));
-
-        let count = self.read_u32_buffer(&readback_buffer);
-        count as f32 / (width * height) as f32
-    }
-
-    fn read_u32_buffer(&self, buffer: &wgpu::Buffer) -> u32 {
-        let slice = buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device.poll(Wait { submission_index: None, timeout: Some(Duration::from_secs(5)) }).expect("Reading buffer timed out");
-        rx.recv().unwrap().unwrap();
-        let data = slice.get_mapped_range().unwrap();
-        let value = u32::from_ne_bytes(data[0..4].try_into().unwrap());
-        drop(data);
-        buffer.unmap();
-        value
     }
 }
 
