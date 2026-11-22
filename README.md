@@ -49,9 +49,9 @@ which makes textures using compute shaders automatically and binds them automati
 ## What this crate is
 
 - A **low-level helper**, not a framework
-- Designed for **engines and tools**, not examples
+- Designed for **engines and tools and examples**
 - Focused on **performance, correctness, and zero magic state**
-- Explicit data flow, no global settings, no hidden stuff
+- Explicit data flow, no global settings
 
 ## Features
 
@@ -67,6 +67,7 @@ which makes textures using compute shaders automatically and binds them automati
 ## Non-goals
 
 This crate intentionally does **not**:
+- render for you, you have to pass.render() yourself
 - manage windowing or surfaces
 - own frame graphs
 - impose a render architecture
@@ -78,7 +79,7 @@ You still control your render passes, encoders, and frame timing!
 ## Philosophy
 
 wgpu is explicit.  
-So of course this crate stays explicit! But it removes repetition.
+So of course this crate stays explicit! But it removes repetition, the goddamn boilerplate.
 
 If something can be:
 - derived
@@ -90,9 +91,9 @@ If something can be:
 
 ## Status
 
-This is an early release (`0.1.x`), so APIs will evolve as I develop my Game, [Rusty Skylines](https://github.com/maxwag9/rusty_skylines).
+This is an early release (`30.0.x`), so APIs will evolve as I develop my Game, [Rusty Skylines](https://github.com/maxwag9/rusty_skylines).
 
-- Feedback welcome
+- Feedback is welcome!
 
 
-MIT License, because this crate WILL HELP YOU!
+MIT License, because this crate WILL HELP YOU! Not maybe!!
