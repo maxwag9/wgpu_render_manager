@@ -86,13 +86,19 @@ pub fn compile_wgsl(
     });
 
     let mut conditional_stack: Vec<bool> = vec![];
-    let processed = preprocess_wgsl(path, &source, defines, &mut conditional_stack);
+    let mut processed = preprocess_wgsl(path, &source, defines, &mut conditional_stack);
 
     if !conditional_stack.is_empty() {
         panic!(
             "Unbalanced preprocessing directives in shader {} (or one of its #included files): open #ifdef/#ifndef without matching #endif",
             path.display()
         );
+    }
+
+    if contains_wgsl_identifier(&processed, "binding_array")
+        && !has_wgsl_enable_directive(&processed, "wgpu_binding_array")
+    {
+        processed.insert_str(0, "enable wgpu_binding_array;\n");
     }
 
     let label_str = path
@@ -209,4 +215,86 @@ fn preprocess_wgsl(
         .collect();
 
     processed_lines.join("\n") + "\n"
+}
+fn contains_wgsl_identifier(source: &str, identifier: &str) -> bool {
+    wgsl_tokens(source)
+        .into_iter()
+        .any(|token| token == identifier.as_bytes())
+}
+
+fn has_wgsl_enable_directive(source: &str, extension: &str) -> bool {
+    wgsl_tokens(source).windows(3).any(|tokens| {
+        tokens[0] == b"enable"
+            && tokens[1] == extension.as_bytes()
+            && tokens[2] == b";"
+    })
+}
+
+fn wgsl_tokens(source: &str) -> Vec<&[u8]> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                i += 2;
+
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+
+                continue;
+            }
+
+            if bytes[i + 1] == b'*' {
+                i += 2;
+                let mut depth = 1usize;
+
+                while i < bytes.len() && depth > 0 {
+                    if i + 1 < bytes.len() {
+                        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                            continue;
+                        }
+
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                            continue;
+                        }
+                    }
+
+                    i += 1;
+                }
+
+                continue;
+            }
+        }
+
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+
+            tokens.push(&bytes[start..i]);
+            continue;
+        }
+
+        tokens.push(&bytes[i..i + 1]);
+        i += 1;
+    }
+
+    tokens
 }

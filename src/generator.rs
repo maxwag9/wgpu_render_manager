@@ -31,13 +31,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 use block_compression::{BC7Settings, CompressionVariant, GpuBlockCompressor};
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use wgpu::util::DeviceExt;
 use wgpu::{Device, Queue, TextureView};
-use wgpu::wgt::PollType::Wait;
 
 pub const NOTEX_SHADER: &str = r#"
 // notex.wgsl - "No Texture" placeholder texture
