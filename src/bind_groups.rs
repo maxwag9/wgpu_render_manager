@@ -1,26 +1,33 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::num::NonZeroU32;
 use wgpu::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Device, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages, TextureAspect, TextureDimension, TextureSampleType, TextureView, TextureViewDimension};
+use crate::renderer::TEXTURE_BINDING_ARRAY_CAPACITY;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct MaterialBindGroupKey {
     views_hash: u64,
     has_shadow: bool,
-    texture_array_hash: u64,
+    texture_pool_generation: u64,
 }
 
 impl MaterialBindGroupKey {
-    fn from_views(views: &[&TextureView], has_shadow: bool, texture_array_view: &TextureView) -> Self {
+    fn from_views(
+        views: &[&TextureView],
+        has_shadow: bool,
+        texture_pool_generation: u64,
+    ) -> Self {
         let mut hasher = DefaultHasher::new();
-        for v in views {
-            v.hash(&mut hasher);
+
+        for view in views {
+            view.hash(&mut hasher);
         }
-        let texture_array_hash = {
-            let mut h = DefaultHasher::new();
-            texture_array_view.hash(&mut h);
-            h.finish()
-        };
-        Self { views_hash: hasher.finish(), has_shadow, texture_array_hash }
+
+        Self {
+            views_hash: hasher.finish(),
+            has_shadow,
+            texture_pool_generation,
+        }
     }
 }
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -66,7 +73,7 @@ impl MaterialBindGroups {
     pub(crate) fn layout(
         &mut self,
         texture_views: &[&TextureView],
-        has_shadow: bool
+        has_shadow: bool,
     ) -> &BindGroupLayout {
         let key = LayoutKey::from_views(texture_views, has_shadow);
 
@@ -74,44 +81,57 @@ impl MaterialBindGroups {
             let mut entries = Vec::new();
             let mut binding = 0;
 
-            // 0: material sampler
             entries.push(BindGroupLayoutEntry {
                 binding,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             });
+
             binding += 1;
 
-            // 1: texture array
             entries.push(BindGroupLayoutEntry {
                 binding,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
                     multisampled: false,
-                    view_dimension: TextureViewDimension::D2Array,
-                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    sample_type: TextureSampleType::Float {
+                        filterable: true,
+                    },
                 },
-                count: None,
+                count: NonZeroU32::new(TEXTURE_BINDING_ARRAY_CAPACITY),
             });
+
             binding += 1;
 
-
             let device_features = self.device.features();
-            // 2..N: individual textures
+
             for view in texture_views {
                 let tex = view.texture();
                 let format = tex.format();
                 let is_multisampled = tex.sample_count() > 1;
 
                 let sample_type = format
-                    .sample_type(Some(TextureAspect::All), Some(device_features))
-                    .or_else(|| format.sample_type(Some(TextureAspect::DepthOnly), Some(device_features)))
+                    .sample_type(
+                        Some(TextureAspect::All),
+                        Some(device_features),
+                    )
+                    .or_else(|| {
+                        format.sample_type(
+                            Some(TextureAspect::DepthOnly),
+                            Some(device_features),
+                        )
+                    })
                     .expect("Unsupported texture format");
 
                 let sample_type = if is_multisampled {
                     match sample_type {
-                        TextureSampleType::Float { .. } => TextureSampleType::Float { filterable: false },
+                        TextureSampleType::Float { .. } => {
+                            TextureSampleType::Float {
+                                filterable: false,
+                            }
+                        }
                         other => other,
                     }
                 } else {
@@ -125,9 +145,11 @@ impl MaterialBindGroups {
                         multisampled: is_multisampled,
                         view_dimension: match tex.dimension() {
                             TextureDimension::D1 => TextureViewDimension::D1,
-                            TextureDimension::D2 if tex.depth_or_array_layers() > 1 => {
-                                TextureViewDimension::D2Array
-                            }
+                            TextureDimension::D2
+                            if tex.depth_or_array_layers() > 1 =>
+                                {
+                                    TextureViewDimension::D2Array
+                                }
                             TextureDimension::D2 => TextureViewDimension::D2,
                             TextureDimension::D3 => TextureViewDimension::D3,
                         },
@@ -139,14 +161,16 @@ impl MaterialBindGroups {
                 binding += 1;
             }
 
-            // Shadow (optional)
             if has_shadow {
                 entries.push(BindGroupLayoutEntry {
                     binding,
                     visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Comparison),
+                    ty: BindingType::Sampler(
+                        SamplerBindingType::Comparison,
+                    ),
                     count: None,
                 });
+
                 binding += 1;
 
                 entries.push(BindGroupLayoutEntry {
@@ -161,10 +185,12 @@ impl MaterialBindGroups {
                 });
             }
 
-            let layout = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("material bind group layout"),
-                entries: &entries,
-            });
+            let layout = self.device.create_bind_group_layout(
+                &BindGroupLayoutDescriptor {
+                    label: Some("material bind group layout"),
+                    entries: &entries,
+                },
+            );
 
             self.layouts.insert(key.clone(), layout);
         }
@@ -178,49 +204,59 @@ impl MaterialBindGroups {
         texture_views: &[&TextureView],
         shadow: Option<(&Sampler, &TextureView)>,
         sampler: &SamplerDescriptor,
-        texture_array_view: &TextureView,
+        texture_pool_views: &[TextureView],
+        texture_pool_generation: u64,
     ) -> &BindGroup {
         let has_shadow = shadow.is_some();
 
-        let key = MaterialBindGroupKey::from_views(texture_views, has_shadow, texture_array_view);
+        let key = MaterialBindGroupKey::from_views(
+            texture_views,
+            has_shadow,
+            texture_pool_generation,
+        );
 
         if !self.bind_groups.contains_key(&key) {
-            let layout = &self.layout(texture_views, has_shadow).clone();
+            let layout = self.layout(texture_views, has_shadow).clone();
 
-            let mut entries: Vec<BindGroupEntry> = Vec::new();
-            let mut binding: u32 = 0;
+            let mut entries = Vec::new();
+            let mut binding = 0;
 
-            // binding 0: material sampler
             let sampler = self.get_or_create_sampler(sampler).clone();
+
             entries.push(BindGroupEntry {
                 binding,
                 resource: BindingResource::Sampler(&sampler),
             });
+
             binding += 1;
 
-            // binding 1: texture array (if present)
+            let texture_pool_refs: Vec<&TextureView> =
+                texture_pool_views.iter().collect();
+
             entries.push(BindGroupEntry {
                 binding,
-                resource: BindingResource::TextureView(texture_array_view),
+                resource: BindingResource::TextureViewArray(
+                    &texture_pool_refs,
+                ),
             });
+
             binding += 1;
 
-
-            // binding 2..N: individual textures
             for view in texture_views {
                 entries.push(BindGroupEntry {
                     binding,
                     resource: BindingResource::TextureView(view),
                 });
+
                 binding += 1;
             }
 
-            // optional shadow
             if let Some((shadow_sampler, shadow_view)) = shadow {
                 entries.push(BindGroupEntry {
                     binding,
                     resource: BindingResource::Sampler(shadow_sampler),
                 });
+
                 binding += 1;
 
                 entries.push(BindGroupEntry {
@@ -229,11 +265,13 @@ impl MaterialBindGroups {
                 });
             }
 
-            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-                label: Some("material bind group"),
-                layout,
-                entries: &entries,
-            });
+            let bind_group = self.device.create_bind_group(
+                &BindGroupDescriptor {
+                    label: Some("material bind group"),
+                    layout: &layout,
+                    entries: &entries,
+                },
+            );
 
             self.bind_groups.insert(key.clone(), bind_group);
         }

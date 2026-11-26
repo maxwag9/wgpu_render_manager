@@ -1,9 +1,8 @@
-use std::borrow::Cow;
 use crate::bind_groups::{LayoutKey, MaterialBindGroups};
 use crate::compute_system::{BufferSet, ComputePipelineOptions, ComputeSystem};
 use crate::fullscreen::{DebugVisualization, DepthDebugParams, FullscreenRenderer};
 use crate::generator::{TextureGenerator, TextureKey};
-use crate::pipelines::{RendererBufferBinding, PipelineCache, PipelineOptions, BufferBindingKind};
+use crate::pipelines::{BufferBindingKind, PipelineCache, PipelineOptions, RendererBufferBinding};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -38,46 +37,40 @@ impl UniformBindGroupKey {
         Self(hasher.finish())
     }
 }
-struct TextureArrayData {
-    texture: wgpu::Texture,
-    view: TextureView,
-    current_size: u32,
+pub const TEXTURE_BINDING_ARRAY_CAPACITY: u32 = 4096;
+
+struct TextureBindingPool {
+    binding_views: Vec<TextureView>,
+    texture_count: u32,
+    generation: u64,
 }
-impl TextureArrayData {
-    fn empty(device: &Device, array_size: u32) -> Self {
-        const TEXTURE_RES: u32 = 512;
-        let mip_count = wgpu::Extent3d {
-            width: TEXTURE_RES,
-            height: TEXTURE_RES,
-            depth_or_array_layers: 1,
-        }.max_mips(wgpu::TextureDimension::D2);
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Procedural Texture Array"),
-            size: wgpu::Extent3d {
-                width: TEXTURE_RES,
-                height: TEXTURE_RES,
-                depth_or_array_layers: array_size,
-            },
-            mip_level_count: mip_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("Procedural Texture Array View"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-
-        TextureArrayData {
-            texture,
-            view,
-            current_size: 0,
+impl TextureBindingPool {
+    fn new(fallback_view: TextureView) -> Self {
+        Self {
+            binding_views: vec![
+                fallback_view;
+                TEXTURE_BINDING_ARRAY_CAPACITY as usize
+            ],
+            texture_count: 0,
+            generation: 0,
         }
+    }
+
+    fn insert(&mut self, view: TextureView) -> u32 {
+        assert!(
+            self.texture_count < TEXTURE_BINDING_ARRAY_CAPACITY,
+            "Texture binding array capacity exceeded: {}",
+            TEXTURE_BINDING_ARRAY_CAPACITY
+        );
+
+        let index = self.texture_count;
+
+        self.binding_views[index as usize] = view;
+        self.texture_count += 1;
+        self.generation = self.generation.wrapping_add(1);
+
+        index
     }
 }
 /// High-level render manager combining texture generation, pipeline caching,
@@ -117,8 +110,8 @@ pub struct RenderManager {
     uniform_bind_groups: HashMap<UniformBindGroupKey, BindGroup>,
     buffer_bind_groups: HashMap<BufferBindGroupKey, BindGroup>,
     defines: HashMap<String, bool>,
-    texture_array: TextureArrayData,
-    texture_array_map: HashMap<TextureKey, u32>
+    texture_pool: TextureBindingPool,
+    texture_array_map: HashMap<TextureKey, u32>,
 }
 
 impl RenderManager {
@@ -132,11 +125,19 @@ impl RenderManager {
     /// by all sub-systems.
     /// Cloning `device` and `queue` is very cheap, as they are just handles in wgpu.
     pub fn new(device: &Device, queue: &Queue) -> Self {
-        let generator = TextureGenerator::new(device.clone(), queue.clone());
+        let mut generator = TextureGenerator::new(device.clone(), queue.clone());
+
+        let fallback_view = generator
+            .get_or_create(&TextureKey::notex())
+            .clone();
+
+        let texture_pool = TextureBindingPool::new(fallback_view);
+
         let pipeline_cache = PipelineCache::new(device.clone());
         let fullscreen = FullscreenRenderer::new(device.clone(), queue.clone());
         let materials = MaterialBindGroups::new(device.clone());
         let compute_system = ComputeSystem::new(device, queue);
+
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -148,8 +149,8 @@ impl RenderManager {
             uniform_bind_groups: HashMap::new(),
             buffer_bind_groups: HashMap::new(),
             defines: HashMap::new(),
-            texture_array: TextureArrayData::empty(device, 32),
-            texture_array_map: HashMap::new()
+            texture_pool,
+            texture_array_map: HashMap::new(),
         }
     }
 
@@ -219,7 +220,7 @@ impl RenderManager {
     ///
     /// ## Shader Binding layout
     /// - `@group(0) @binding(0)`: trilinear sampler
-    /// - `@group(0) @binding(1)`: textures as texture_2d_array, used with [`ensure_textures()`](Self::ensure_textures)
+    /// - `@group(0) @binding(1)`: textures as binding_array<texture_2d<f32>, 4096>, used with [`ensure_textures()`](Self::ensure_textures)
     /// - `@group(0) @binding(2..n)`: textures as texture_2d<f32> or texture_multisampled_2d<f32> (Rgba8Unorm)
     /// - `@group(0) @binding(n+1)`: (optional) shadow_sampler
     /// - `@group(0) @binding(n+2)`: (optional) shadow textures as texture_depth_2d_array
@@ -274,7 +275,7 @@ impl RenderManager {
     ///
     /// ## Shader Binding layout
     /// - `@group(0) @binding(0)`: trilinear sampler
-    /// - `@group(0) @binding(1)`: textures as texture_2d_array, used with [`ensure_textures()`](Self::ensure_textures)
+    /// - `@group(0) @binding(1)`: textures as binding_array<texture_2d<f32>, 4096>, used with [`ensure_textures()`](Self::ensure_textures)
     /// - `@group(0) @binding(2..n)`: textures as texture_2d<f32> or texture_multisampled_2d<f32>
     /// - `@group(0) @binding(n+1)`: (optional) shadow_sampler
     /// - `@group(0) @binding(n+2)`: (optional) shadow textures as texture_depth_2d_array
@@ -332,7 +333,7 @@ impl RenderManager {
         pass.set_pipeline(&pipeline);
 
         // Material bind group
-        let material_bg = self.materials.get_or_create(texture_views, shadow, &options.sampler, &self.texture_array.view);
+        let material_bg = self.materials.get_or_create(texture_views, shadow, &options.sampler, &self.texture_pool.binding_views, self.texture_pool.generation);
         pass.set_bind_group(0, material_bg, &[]);
 
         // Uniform bind group
@@ -388,7 +389,7 @@ impl RenderManager {
     ///
     /// ## Shader Binding layout
     /// - `@group(0) @binding(0)`: trilinear sampler
-    /// - `@group(0) @binding(1)`: textures as texture_2d_array, used with [`ensure_textures()`](Self::ensure_textures)
+    /// - `@group(0) @binding(1)`: textures as binding_array<texture_2d<f32>, 4096>, used with [`ensure_textures()`](Self::ensure_textures)
     /// - `@group(0) @binding(2..n)`: textures as texture_2d<f32> or texture_multisampled_2d<f32> (Rgba8Unorm)
     /// - `@group(0) @binding(n+1)`: (optional) shadow_sampler
     /// - `@group(0) @binding(n+2)`: (optional) shadow textures as texture_depth_2d_array
@@ -463,7 +464,7 @@ impl RenderManager {
         pass.set_pipeline(&pipeline);
 
         // Material bind group at group 0
-        let material_bg = self.materials.get_or_create(texture_views, shadow, &options.sampler, &self.texture_array.view);
+        let material_bg = self.materials.get_or_create(texture_views, shadow, &options.sampler, &self.texture_pool.binding_views, self.texture_pool.generation);
         pass.set_bind_group(0, material_bg, &[]);
 
         // Uniform bind group at group 1
@@ -667,7 +668,8 @@ impl RenderManager {
             texture_views,
             shadow,
             &options.sampler,
-            &self.texture_array.view,
+            &self.texture_pool.binding_views,
+            self.texture_pool.generation
         );
 
         pass.set_bind_group(0, material_bg, &[]);
@@ -906,11 +908,11 @@ impl RenderManager {
     /// Subsequent calls with the same key return the cached index.
     ///
     /// ## Texture array details
-    /// - Format: Rgba8Unorm
-    /// - Resolution: 512x512 per layer
-    /// - Max layers: 512
-    /// - Mipmaps: Yes (10 levels for 512x512)
-    /// - Bound at: `@group(0) @binding(1)` in shaders
+    /// - Format: Rgba8Unorm or Bc7RgbaUnorm
+    /// - Resolution: any per texture
+    /// - Max textures: 4096
+    /// - Mipmaps: Yes
+    /// - Bound at: `@group(0) @binding(1)` in shaders with binding_array<texture_2d<f32>, 4096>
     ///
     /// ## Returns
     /// A `Vec<u32>` containing the layer index for each input `TextureKey`.
@@ -930,134 +932,22 @@ impl RenderManager {
         let mut indices = Vec::with_capacity(keys.len());
 
         for key in keys {
-            let key = if key.resolution == 512 {
-                Cow::Borrowed(key)
-            } else {
-                Cow::Owned({
-                    let mut k = key.clone();
-                    k.resolution = 512;
-                    k
-                })
-            };
-            if let Some(&index) = self.texture_array_map.get(&key) {
+            if let Some(&index) = self.texture_array_map.get(key) {
                 indices.push(index);
-            } else {
-                let index = self.add_to_texture_array(&key);
-                indices.push(index);
+                continue;
             }
+
+            let view = self.generator.get_or_create(key).clone();
+            let index = self.texture_pool.insert(view);
+
+            self.texture_array_map.insert(key.clone(), index);
+
+            self.materials.clear();
+
+            indices.push(index);
         }
 
         indices
-    }
-
-    fn add_to_texture_array(&mut self, key: &TextureKey) -> u32 {
-        let current_size = self.texture_array.current_size;
-        let index = current_size;
-
-        let source_texture = self.generator.get_or_create(&key).texture();
-
-        // Resize if needed
-        if current_size == self.texture_array.texture.depth_or_array_layers() {
-            let old_array = self.texture_array.texture.clone();
-            let old_layers = old_array.depth_or_array_layers();
-            let mip_count = old_array.mip_level_count();
-
-            let new_capacity = (current_size as f32 * 1.5) as u32 + 1;
-
-            // Create new array
-            let mut new_array = TextureArrayData::empty(&self.device, new_capacity);
-
-            let mut encoder = self.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
-                    label: Some("resize texture array"),
-                },
-            );
-
-            // Copy ALL old layers into new texture
-            for layer in 0..old_layers {
-                for mip in 0..mip_count {
-                    let mip_size = (512u32 >> mip).max(1);
-
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &old_array,
-                            mip_level: mip,
-                            origin: wgpu::Origin3d {
-                                x: 0,
-                                y: 0,
-                                z: layer,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &new_array.texture,
-                            mip_level: mip,
-                            origin: wgpu::Origin3d {
-                                x: 0,
-                                y: 0,
-                                z: layer,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: mip_size,
-                            height: mip_size,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                }
-            }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-
-            new_array.current_size = current_size;
-            self.texture_array = new_array;
-        }
-
-        // Now insert the new texture
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
-                label: Some("texture array copy"),
-            },
-        );
-
-        let array_texture = &self.texture_array.texture;
-        let mip_count = source_texture.mip_level_count();
-
-        for mip in 0..mip_count {
-            let mip_size = (512u32 >> mip).max(1);
-
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: source_texture,
-                    mip_level: mip,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: array_texture,
-                    mip_level: mip,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: index,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: mip_size,
-                    height: mip_size,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        self.texture_array.current_size = index + 1;
-        self.texture_array_map.insert(key.clone(), index);
-
-        index
     }
 }
 
